@@ -1,7 +1,16 @@
 import type { ReactNode } from "react";
 import { toast as sonnerToast, type ExternalToast } from "sonner";
+import { copyToClipboard } from "../hooks/clipboard";
 
-/** Builds a "Copy" action that puts the toast's title + description on the clipboard. */
+/**
+ * Builds a "Copy" action that puts the toast's title + description on the
+ * clipboard.
+ *
+ * It goes through {@link copyToClipboard} rather than calling
+ * `navigator.clipboard` directly: that API is absent on an insecure origin
+ * (`http://<lan-ip>:<port>`), and the helper's legacy fallback is what makes
+ * the action work there too.
+ */
 function withCopyAction(title: string, description?: string | null): ExternalToast {
   const text = [title, description].filter((value): value is string => Boolean(value)).join("\n");
   return {
@@ -9,13 +18,10 @@ function withCopyAction(title: string, description?: string | null): ExternalToa
     action: {
       label: "Copy",
       onClick: () => {
-        if (!navigator.clipboard) {
-          sonnerToast.error("Clipboard unavailable");
-          return;
-        }
-        void navigator.clipboard.writeText(text).then(
-          () => sonnerToast.success("Toast content copied", { duration: 2_000 }),
-          () => sonnerToast.error("Copy failed", { duration: 2_000 }),
+        void copyToClipboard(text).then((ok) =>
+          ok
+            ? sonnerToast.success("Toast content copied", { duration: 2_000 })
+            : sonnerToast.error("Copy failed", { duration: 2_000 }),
         );
       },
     },
@@ -39,13 +45,10 @@ export const toast = {
       action: {
         label: "Copy",
         onClick: () => {
-          if (!navigator.clipboard) {
-            sonnerToast.error("Clipboard unavailable");
-            return;
-          }
-          void navigator.clipboard.writeText(`${title}\n${copyText}`).then(
-            () => sonnerToast.success("Toast content copied", { duration: 2_000 }),
-            () => sonnerToast.error("Copy failed", { duration: 2_000 }),
+          void copyToClipboard(`${title}\n${copyText}`).then((ok) =>
+            ok
+              ? sonnerToast.success("Toast content copied", { duration: 2_000 })
+              : sonnerToast.error("Copy failed", { duration: 2_000 }),
           );
         },
       },

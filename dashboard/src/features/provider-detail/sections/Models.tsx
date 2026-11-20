@@ -48,6 +48,7 @@ import {
 } from "../../../lib/format/tokens";
 import { toast } from "../../../lib/toast";
 import { useTrackedTimeout } from "../../../hooks/use-timeout";
+import { copyToClipboard } from "../../../hooks/clipboard";
 import { PROBE_REASONING_EFFORTS, formatThinkingSuffix, type ModelCatalogEntry, type ProbeReasoningEffort } from "../../../data/contracts";
 import { formatProbeDuration } from "../../../lib/format/numbers";
 
@@ -1430,9 +1431,11 @@ function ModelCard({
             aria-label={`Copy ${copyId}`}
             title={`Copy ${copyId}`}
             onClick={() => {
-              void navigator.clipboard?.writeText(copyId);
-              setCopied(true);
-              scheduleCopyReset(() => setCopied(false), 1500);
+              void copyToClipboard(copyId).then((ok) => {
+                if (!ok) return;
+                setCopied(true);
+                scheduleCopyReset(() => setCopied(false), 1500);
+              });
             }}
             className="shrink-0 p-2 opacity-70"
           />

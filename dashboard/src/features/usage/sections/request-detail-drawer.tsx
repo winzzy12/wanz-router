@@ -17,6 +17,7 @@ import { consoleRequest, getErrorMessage } from "../../../data/api";
 import { cn } from "../../../lib/classnames";
 import { downloadTextFile } from "../../../lib/download";
 import { toast } from "../../../lib/toast";
+import { copyToClipboard } from "../../../hooks/clipboard";
 import { Button } from "../../../components/ui/button";
 import { Drawer } from "../../../components/ui/drawer";
 import { Stack } from "../../../components/ui/stack";
@@ -204,15 +205,19 @@ export function RequestDetailDrawer({
   const [downloading, setDownloading] = useState(false);
   const scheduleReset = useTrackedTimeout();
   const copyRequestId = () => {
-    void navigator.clipboard?.writeText(detail?.requestId ?? "");
-    setCopiedRequestId(true);
-    scheduleReset(() => setCopiedRequestId(false), 1500);
+    void copyToClipboard(detail?.requestId ?? "").then((ok) => {
+      if (!ok) return;
+      setCopiedRequestId(true);
+      scheduleReset(() => setCopiedRequestId(false), 1500);
+    });
   };
   const copyPayload = (kind: PayloadKind, payload: unknown) => {
     const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
-    void navigator.clipboard?.writeText(text);
-    setCopiedPayload(kind);
-    scheduleReset(() => setCopiedPayload(null), 1500);
+    void copyToClipboard(text).then((ok) => {
+      if (!ok) return;
+      setCopiedPayload(kind);
+      scheduleReset(() => setCopiedPayload(null), 1500);
+    });
   };
   const downloadTelemetry = async () => {
     if (!detail) return;

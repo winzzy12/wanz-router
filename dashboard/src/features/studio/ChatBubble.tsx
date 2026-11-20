@@ -6,6 +6,7 @@ import { Button } from "../../components/ui/button";
 import { Dialog } from "../../components/ui/dialog";
 import type { LabMessage } from "./session";
 import { createSvgPreviewDocument } from "./svgPreview";
+import { copyToClipboard } from "../../hooks/clipboard";
 
 
 
@@ -117,12 +118,7 @@ function MarkdownPre({ children }: { readonly children?: ReactNode }): ReactNode
   const isSvg = className.split(/\s+/).includes("language-svg");
   const preview = createSvgPreviewDocument(source);
   const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(source);
-      setCopyState("copied");
-    } catch {
-      setCopyState("failed");
-    }
+    setCopyState((await copyToClipboard(source)) ? "copied" : "failed");
   };
   const copyControls = (
     <div className="flex items-center justify-end gap-3">
@@ -271,7 +267,7 @@ export function ChatBubble({
   }, [thinking, thinkingOpen]);
 
   const copy = async () => {
-    await navigator.clipboard.writeText(message.text);
+    if (!(await copyToClipboard(message.text))) return;
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1200);
   };

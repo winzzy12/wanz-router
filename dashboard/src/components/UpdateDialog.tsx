@@ -9,6 +9,7 @@ import {
   NPM_PACKAGE_URL,
   NPM_UPDATE_COMMAND,
 } from "../lib/links";
+import { copyToClipboard } from "../hooks/clipboard";
 
 /** Which release the operator has already been told about and dismissed. */
 const DISMISS_KEY = "cartethyia:update-dismissed";
@@ -72,9 +73,14 @@ export interface UpdateDialogProps {
 function useCopy(): { copied: boolean; copy: (text: string) => void } {
   const [copied, setCopied] = useState(false);
   const copy = (text: string): void => {
-    void navigator.clipboard?.writeText(text);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1_500);
+    // Only claim success once the write actually landed: on an insecure origin
+    // the legacy path can still fail, and a button that says "Copied" while the
+    // clipboard is empty is worse than no feedback at all.
+    void copyToClipboard(text).then((ok) => {
+      if (!ok) return;
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    });
   };
   return { copied, copy };
 }

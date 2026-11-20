@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/winzzy12/wanz-router/main/quick-set
 
 ## Update
 ```bash
-curl -fsSL https://raw.githubusercontent.com/winzzy12/wanz-router/main/quick-update.sh | bash
+wget https://raw.githubusercontent.com/winzzy12/wanz-router/main/quick-update.sh && chmod +x quick-update.sh && ./quick-update.sh
 ```
 
 ## Uninstall

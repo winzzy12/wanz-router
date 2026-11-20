@@ -71,6 +71,18 @@ export const CONSOLE_FALLBACK: ConsoleRouteMeta = {
 
 export const CONSOLE_ROUTE_SPECS: readonly ConsoleRouteSpec[] = [
   {
+    // Deliberately first in the sidebar: routing is what this console is for,
+    // so the page an operator opens to steer traffic leads the nav instead of
+    // sitting third under a "Control" heading.
+    key: "combos",
+    path: "/combos",
+    navGroup: "Main",
+    navLabel: "Combos & Routes",
+    title: "Combos & Routing",
+    sub: "Failover policies, model aliases, and weighted routes",
+    icon: Cpu,
+  },
+  {
     key: "overview",
     path: "/",
     navGroup: "Main",
@@ -121,15 +133,6 @@ export const CONSOLE_ROUTE_SPECS: readonly ConsoleRouteSpec[] = [
     title: "Model Lab",
     sub: "Chat a routed model without leaving the console",
     icon: FlaskConical,
-  },
-  {
-    key: "combos",
-    path: "/combos",
-    navGroup: "Control",
-    navLabel: "Combos & Routes",
-    title: "Combos & Routing",
-    sub: "Failover policies, model aliases, and weighted routes",
-    icon: Cpu,
   },
   {
     key: "quota",

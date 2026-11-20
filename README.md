@@ -47,8 +47,9 @@ curl -fsSL https://raw.githubusercontent.com/winzzy12/wanz-router/main/quick-set
 
 ## Uninstall
 ```bash
-curl -fsSL https://raw.githubusercontent.com/winzzy12/wanz-router/main/uninstall.sh | bash
+wget https://raw.githubusercontent.com/winzzy12/wanz-router/main/uninstall.sh && chmod +x uninstall.sh && ./uninstall.sh
 ```
+
 
 Or, from a local checkout:
 

@@ -13,7 +13,6 @@ import {
   Route,
   Search,
   Server,
-  Share2,
   Shield,
   ShieldCheck,
   ShieldX,
@@ -25,7 +24,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Button } from "./ui/button";
-import { FileInput, Input } from "./ui/input";
+import { Input } from "./ui/input";
 import { Switch } from "./ui/switch";
 import { Select } from "./ui/select";
 import { ModelPickerModal } from "./ModelPicker";
@@ -36,8 +35,6 @@ import { toast } from "../lib/toast";
 import { getErrorMessage } from "../data/api";
 import {
   CLIENT_ROUTERS,
-  SHARE_POPUP_IMAGE_MAX_BYTES,
-  SHARE_POPUP_IMAGE_MIMES,
   TENANT_KEY_SCOPES,
   normalizeClientRouterId,
   type ApiKeyResponse,
@@ -340,12 +337,6 @@ export interface KeyFormInput {
   notesTitle?: string;
   notesSubtitle?: string;
   notesBody?: string;
-  /** Toggle for the single share-page popup; the owner edits its copy freely. */
-  sharePopupEnabled: boolean;
-  /** Uploaded art as a data URL; `null` clears it, omitted leaves it unchanged. */
-  sharePopupImage?: string | null;
-  sharePopupTitle: string;
-  sharePopupBody: string;
 }
 interface KeyFormProps {
   mode: "create" | "edit";
@@ -445,43 +436,6 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
     const b = (record as unknown as { notesBody?: string | null })?.notesBody;
     return b ?? "";
   });
-  const [sharePopupEnabled, setSharePopupEnabled] = useState(record?.sharePopupEnabled ?? true);
-  // Tri-state upload: no pick yet, a freshly picked data URL, or an explicit
-  // removal of the art already stored on the key.
-  const [sharePopupImageDataUrl, setSharePopupImageDataUrl] = useState<string | null>(null);
-  const [sharePopupImageRemoved, setSharePopupImageRemoved] = useState(false);
-  const [sharePopupImageError, setSharePopupImageError] = useState<string | null>(null);
-  const hasStoredImage = record?.sharePopupImageMime !== undefined;
-  const popupImagePreview =
-    sharePopupImageDataUrl ??
-    (hasStoredImage && !sharePopupImageRemoved && record !== null
-      ? `/console/api/api-keys/${record.id}/share-popup-image`
-      : null);
-  // Pre-fill QRIS image when there is no stored image and user hasn't picked one yet.
-  useEffect(() => {
-    if (hasStoredImage || sharePopupImageDataUrl !== null || sharePopupImageRemoved) return;
-    fetch("/donation/qris-risun-marke.webp")
-      .then((r) => r.ok ? r.blob() : Promise.reject(r.status))
-      .then((blob) => {
-        const { promise, resolve, reject } = Promise.withResolvers<string>();
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-        return promise;
-      })
-      .then((dataUrl) => setSharePopupImageDataUrl(dataUrl))
-      .catch(() => { /* silently skip if asset not reachable */ });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  const [sharePopupTitle, setSharePopupTitle] = useState(
-    record?.sharePopupTitle ??
-    "Support via QRIS"
-  );
-  const [sharePopupBody, setSharePopupBody] = useState(
-    record?.sharePopupBody ??
-    "Scan the QR code above with any QRIS-compatible banking or e-wallet app to support this gateway's upkeep. Every contribution helps keep the service running — thank you! 🙏"
-  );
   const [keyMode, setKeyMode] = useState<ApiKeyResponse["keyMode"]>(
     record?.keyMode ?? "personal",
   );
@@ -510,9 +464,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
         notesBody.trim().length > 0 ||
         scopes.length > 0 ||
         models.length > 0 ||
-        blockedRouters.length > 0 ||
-        sharePopupImageDataUrl !== null ||
-        sharePopupImageRemoved
+        blockedRouters.length > 0
       );
     }
     const r = record;
@@ -533,12 +485,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
       scopes.join(",") !== initialApiKeyScopes(r).join(",") ||
       modelAccessMode !== ((r as unknown as { modelAccessMode?: "whitelist" | "blacklist" | null })?.modelAccessMode ?? "whitelist") ||
       models.join(",") !== (r.modelList ?? []).join(",") ||
-      blockedRouters.join(",") !== ((r as unknown as { clientRouterDenylist?: string[] | null })?.clientRouterDenylist ?? []).join(",") ||
-      sharePopupEnabled !== (r.sharePopupEnabled ?? true) ||
-      sharePopupImageDataUrl !== null ||
-      sharePopupImageRemoved ||
-      sharePopupTitle.trim() !== (r.sharePopupTitle ?? "Support via QRIS") ||
-      sharePopupBody.trim() !== (r.sharePopupBody ?? "Scan the QR code above with any QRIS-compatible banking or e-wallet app to support this gateway's upkeep. Every contribution helps keep the service running — thank you! 🙏")
+      blockedRouters.join(",") !== ((r as unknown as { clientRouterDenylist?: string[] | null })?.clientRouterDenylist ?? []).join(",")
     );
   }, [
     mode,
@@ -561,11 +508,6 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
     notesTitle,
     notesSubtitle,
     notesBody,
-    sharePopupEnabled,
-    sharePopupImageDataUrl,
-    sharePopupImageRemoved,
-    sharePopupTitle,
-    sharePopupBody,
   ]);
 
   useDialogDirty(dirty);
@@ -592,14 +534,6 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
       notesTitle: notesTitle.trim(),
       notesSubtitle: notesSubtitle.trim(),
       notesBody: notesBody.trim(),
-      sharePopupEnabled,
-      ...(sharePopupImageDataUrl !== null
-        ? { sharePopupImage: sharePopupImageDataUrl }
-        : sharePopupImageRemoved
-          ? { sharePopupImage: null }
-          : {}),
-      sharePopupTitle: sharePopupTitle.trim(),
-      sharePopupBody: sharePopupBody.trim(),
     });
   };
   useEffect(() => {
@@ -879,87 +813,6 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: 
         )}
       </section>
       </div>
-      <section className="flex flex-col gap-3 min-w-0 p-4 border border-inner-border rounded-card bg-surface-2 col-span-full" aria-labelledby="share-popup-heading">
-        <div className="flex items-start justify-between gap-6">
-          <div>
-            <h3 id="share-popup-heading" className="text-caption font-bold text-text-primary">
-              <Share2 size={16} className="mr-2 inline text-accent" aria-hidden="true" />
-              Share page popup
-            </h3>
-            <p className="mt-1 text-badge text-text-tertiary">
-              Optional card visitors open from the Base URL card on your share page.
-            </p>
-          </div>
-          <Switch
-            checked={sharePopupEnabled}
-            onChange={(checked) => setSharePopupEnabled(checked)}
-            disabled={busy}
-            label="Enable popup"
-          />
-        </div>
-        {sharePopupEnabled ? (
-          <div className="flex gap-7 items-start mt-2 min-w-0 max-medium:flex-col max-medium:items-stretch">
-            <div className="flex flex-col gap-4 min-w-0 w-100 shrink-0 max-medium:w-auto">
-              {popupImagePreview ? (
-                <img className="block w-full h-66 object-cover border border-inner-border rounded-control bg-surface-1 max-medium:h-80" src={popupImagePreview} alt="Popup image preview" />
-              ) : (
-                <div className="flex items-center justify-center w-full h-66 object-cover border border-dashed border-inner-border rounded-control bg-surface-1 text-text-tertiary text-badge max-medium:h-80" aria-hidden="true">
-                  <span>No image</span>
-                </div>
-              )}
-              <FileInput
-                id="share-popup-image"
-                accept={SHARE_POPUP_IMAGE_MIMES.join(",")}
-                aria-label="Popup image"
-                disabled={busy}
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  event.target.value = "";
-                  if (!file) return;
-                  setSharePopupImageError(null);
-                  if (file.size > SHARE_POPUP_IMAGE_MAX_BYTES) {
-                    setSharePopupImageDataUrl(null);
-                    setSharePopupImageError("Image must be 2 MB or smaller.");
-                    return;
-                  }
-                  const reader = new FileReader();
-                  reader.onload = () => {
-                    setSharePopupImageDataUrl(String(reader.result));
-                    setSharePopupImageRemoved(false);
-                  };
-                  reader.onerror = () => setSharePopupImageError("Could not read that file.");
-                  reader.readAsDataURL(file);
-                }}
-              />
-              {popupImagePreview ? (
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  type="button"
-                  disabled={busy}
-                  className="h-14 px-5 text-badge self-start"
-                  onClick={() => {
-                    setSharePopupImageDataUrl(null);
-                    setSharePopupImageRemoved(true);
-                    setSharePopupImageError(null);
-                  }}
-                >
-                  Remove image
-                </Button>
-              ) : null}
-              {sharePopupImageError ? <p className="form-error">{sharePopupImageError}</p> : null}
-              <p className="m-0 text-text-tertiary text-badge leading-normal">PNG, JPEG, WebP, or GIF up to 2 MB.</p>
-            </div>
-            <div className="flex flex-col gap-4 min-w-0 flex-1 [&_.form-group]:gap-2">
-              <Input label="Popup title" value={sharePopupTitle} onChange={(event) => setSharePopupTitle(event.target.value)} maxLength={120} placeholder="Support this gateway" disabled={busy} />
-              <div className="form-group">
-                <label className="form-label" htmlFor="share-popup-copy">Message</label>
-                <textarea className="form-textarea" id="share-popup-copy" value={sharePopupBody} onChange={(event) => setSharePopupBody(event.target.value)} maxLength={1200} rows={3} placeholder="If this service helps you, consider supporting its upkeep…" disabled={busy} />
-              </div>
-            </div>
-          </div>
-        ) : null}
-      </section>
       <details className="group min-w-0 col-span-full rounded-card border border-inner-border bg-surface-2">
         <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-4 [&::-webkit-details-marker]:hidden">
           <span className="flex min-w-0 items-start gap-3">

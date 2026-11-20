@@ -22,6 +22,15 @@ export const GITHUB_REPO_URL = `https://github.com/${GITHUB_REPO}`;
 export const GITHUB_RELEASES_URL = `https://github.com/${GITHUB_REPO}/releases`;
 
 /**
+ * This distribution's own repository.
+ *
+ * The sidebar version label links here rather than to upstream: an operator
+ * running this build wants the source they actually deployed, not the project
+ * it was forked from.
+ */
+export const WANZ_ROUTER_REPO_URL = "https://github.com/winzzy12/wanz-router/tree/main";
+
+/**
  * The hidden original. Same history, different account, kept as a fallback
  * for anyone who still has access and so a rename does not drop the historical
  * link entirely.

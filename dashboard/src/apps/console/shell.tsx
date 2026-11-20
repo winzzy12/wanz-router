@@ -31,8 +31,9 @@ import { prefetchRouteIntent } from "../../data/route-prefetch";
 import { POLL } from "../../data/query-policy";
 import { useSystemHealth, useLatestRelease, useNotifications, type NotificationItem } from "../../hooks/system";
 import { useProviders } from "../../hooks/providers";
-import { DASHBOARD_VERSION } from "../../lib/version";
+import { DASHBOARD_RELEASE_LABEL, DASHBOARD_VERSION } from "../../lib/version";
 import { formatUptime } from "../../lib/format/numbers";
+import { WANZ_ROUTER_REPO_URL } from "../../lib/links";
 import { isNewerRelease } from "../../data/contracts";
 import type { SessionUser } from "../../data/contracts";
 import { navigationGroups, resolveRouteMeta, type NavGroupDef, type NavItemDef } from "./route-manifest";
@@ -747,6 +748,14 @@ export function DashboardShell({
                 <span>Wanz Router</span>
               </div>
               <div className="brand-version-badge">
+                <a
+                  href={WANZ_ROUTER_REPO_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="brand-version-link"
+                >
+                  {DASHBOARD_RELEASE_LABEL}
+                </a>
                 {updateAvailable ? (
                   // A button, not a link to GitHub: the badge says an update
                   // exists and the dialog tells the operator how to install it.

@@ -97,6 +97,36 @@ From the install root (default `~/.local/share/Cartethyia/app`, or wherever
 
 ---
 
+## Update
+
+Pull the latest commit, rebuild, and restart in one step:
+
+```bash
+bash quick-update.sh              # update to the latest commit, then restart
+bash quick-update.sh --check      # show what is new, change nothing
+bash quick-update.sh --no-restart # pull and rebuild, leave the gateway stopped
+bash quick-update.sh --force      # rebuild and restart even when already current
+```
+
+What it does, in order:
+
+1. Refuses to touch a checkout with uncommitted changes to tracked files.
+2. Fetches the configured branch and **fast-forwards only** — never a merge and
+   never a reset, so local commits are never silently discarded.
+3. Reinstalls dependencies and rebuilds the dashboard, the AOT bundle, and the
+   compiled gateway binary.
+4. Stops the gateway through `./carte stop` (a drain, not a kill), starts the
+   freshly built binary, and waits for `/health` to answer before reporting
+   success.
+
+- Point it at a non-default install with `CARTETHYIA_ROOT=/path/to/app bash quick-update.sh`.
+- It also refuses a checkout that does not descend from the configured branch,
+  which is what catches a fork whose `origin` points at a different repository.
+- Override the source with `CARTETHYIA_REPO_URL=…` and the branch with
+  `CARTETHYIA_BRANCH=…`.
+
+---
+
 ## Uninstall
 
 Remove a local install cleanly with the bundled script:

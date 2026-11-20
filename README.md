@@ -91,6 +91,31 @@ From the install root (default `~/.local/share/Cartethyia/app`, or wherever
 
 ---
 
+## Uninstall
+
+Remove a local install cleanly with the bundled script:
+
+```bash
+bash uninstall.sh            # interactive (asks for confirmation)
+bash uninstall.sh --yes      # non-interactive
+bash uninstall.sh --dry-run  # preview only, change nothing
+```
+
+The script stops the running gateway through the proper drain path
+(`./carte stop` — never a blanket `pkill`), then deletes the entire install
+directory: checkout, `.env`, SQLite data, and built artifacts.
+
+- Point it at a non-default install with `CARTETHYIA_ROOT=/path/to/app bash uninstall.sh`.
+- It refuses to delete the filesystem root, your home directory, or anything
+  that does not look like a Cartethyia install.
+- **Bun is left in place** (`~/.bun`) since other tools may share it; delete it
+  manually if you no longer need it.
+
+> **Tip:** export a backup first (`./carte menu` → Backup) if you might want to
+> restore this install later. Uninstalling deletes all local data.
+
+---
+
 ## Database modes
 
 | Mode | Pick it when |

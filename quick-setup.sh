@@ -54,6 +54,7 @@ bash scripts/install.sh --local --lite --root "$ROOT" "$@"
 
 # 5. Report.
 log "Done."
-echo "  Console : http://localhost:12800/console"
-echo "  Manage  : $ROOT/carte menu"
-echo "  Stop    : $ROOT/carte stop"
+echo "  Console   : http://localhost:12800/console"
+echo "  Manage    : $ROOT/carte menu"
+echo "  Stop      : $ROOT/carte stop"
+echo "  Uninstall : bash $ROOT/uninstall.sh"

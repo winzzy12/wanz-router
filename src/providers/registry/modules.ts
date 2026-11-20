@@ -8,24 +8,35 @@ import {
 import { ProviderRegistry, toRegistration, type ProviderModule } from "../provider-registry";
 import { PROVIDER_CAPABILITIES } from "./capabilities";
 
-/** Canonical provider registry; every provider subsystem consumes these rows. */
-export const BUNDLED_PROVIDER_MODULES: readonly ProviderModule[] = BUNDLED_PROVIDER_METADATA.map((definition) => {
-  const implementation = PROVIDER_CAPABILITIES[definition.id];
-  if (implementation === undefined) throw new Error(`Missing provider implementation: ${definition.id}`);
-  const compatibility = PROVIDER_COMPATIBILITY_PROFILES[definition.id];
-  return {
-    id: definition.id,
-    displayName: definition.displayName,
-    baseUrl: definition.baseUrl,
-    serviceKinds: definition.serviceKinds,
-    defaultSkipProxy: definition.defaultSkipProxy,
-    ...implementation,
-    upstreamHost: providerUpstreamHost(definition.id),
-    ...(compatibility === undefined ? {} : { compatibility }),
-    wireFamilyDefault: providerDefaultWireFamily(definition.id),
-    requiresAccount: providerRequiresAccount(definition.id),
-  };
-});
+/**
+ * Canonical provider registry; every provider subsystem consumes these rows.
+ *
+ * Retired definitions are filtered out here, at the single point where the
+ * shipped catalog is composed: a retired provider keeps its id and adapter so
+ * the type and module stay intact, but it is never registered, never seeded
+ * into the database, and never listed. The boot-time
+ * `retireUnbundledProviders` pass then drops whatever row a previous release
+ * left behind.
+ */
+export const BUNDLED_PROVIDER_MODULES: readonly ProviderModule[] = BUNDLED_PROVIDER_METADATA
+  .filter((definition) => !definition.retired)
+  .map((definition) => {
+    const implementation = PROVIDER_CAPABILITIES[definition.id];
+    if (implementation === undefined) throw new Error(`Missing provider implementation: ${definition.id}`);
+    const compatibility = PROVIDER_COMPATIBILITY_PROFILES[definition.id];
+    return {
+      id: definition.id,
+      displayName: definition.displayName,
+      baseUrl: definition.baseUrl,
+      serviceKinds: definition.serviceKinds,
+      defaultSkipProxy: definition.defaultSkipProxy,
+      ...implementation,
+      upstreamHost: providerUpstreamHost(definition.id),
+      ...(compatibility === undefined ? {} : { compatibility }),
+      wireFamilyDefault: providerDefaultWireFamily(definition.id),
+      requiresAccount: providerRequiresAccount(definition.id),
+    };
+  });
 
 /**
  * Eagerly composes the default provider registry from the canonical

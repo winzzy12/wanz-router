@@ -125,9 +125,12 @@ describe("bundled API-key provider completeness", () => {
 
   test("every bundled metadata id has a registry entry", () => {
     // `BUNDLED_PROVIDER_MODULES` throws at module load when this fails, so the
-    // test proves the boot path rather than a lookup.
+    // test proves the boot path rather than a lookup. A `retired` definition is
+    // deliberately not shipped: it keeps its id and adapter so the closed id
+    // union stays intact, but it is never registered.
     const moduleIds = new Set(BUNDLED_PROVIDER_MODULES.map((m) => m.id));
     for (const metadata of BUNDLED_PROVIDER_METADATA) {
+      if (metadata.retired) continue;
       expect(moduleIds.has(metadata.id)).toBe(true);
     }
   });

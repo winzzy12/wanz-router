@@ -125,7 +125,7 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     credentialHint: "Sign in with Cursor or import a Cursor API key (crsr_...).",
   },
   { id: "kimi", displayName: "Kimi Code", baseUrl: "https://api.kimi.com/coding", credentialUrl: "https://platform.moonshot.ai/console/api-keys" },
-  { id: "opencode", displayName: "OpenCode Free", baseUrl: "https://opencode.ai", requiresAccount: false, ipScopedRateLimit: true, hasAdapterUserAgent: true },
+  { id: "opencode", displayName: "OpenCode Free", baseUrl: "https://opencode.ai", requiresAccount: false, ipScopedRateLimit: true, hasAdapterUserAgent: true, retired: true },
   { id: "opencode-zen", displayName: "OpenCode Zen", baseUrl: "https://opencode.ai", hasAdapterUserAgent: true, credentialUrl: "https://opencode.ai/auth" },
   { id: "opencode-go", displayName: "OpenCode Go", baseUrl: "https://opencode.ai", credentialUrl: "https://opencode.ai/auth" },
   { id: "cerebras", displayName: "Cerebras", baseUrl: "https://api.cerebras.ai/v1", credentialUrl: "https://cloud.cerebras.ai/platform" },
@@ -576,6 +576,17 @@ export interface BundledProviderMetadata {
   readonly bespokeWire: boolean;
   /** True when the provider adapter builds its own User-Agent header. */
   readonly hasAdapterUserAgent: boolean;
+  /**
+   * True when the provider is no longer shipped as a routable provider.
+   *
+   * A retired row keeps its identity so the id stays a valid type member and
+   * its adapter module keeps compiling, but it is excluded from the registry
+   * and the database catalog: it is never registered, never seeded, never
+   * listed, and its stale catalog row is removed on the next boot. OpenCode
+   * Free is the current case: the anonymous free tier is no longer offered,
+   * while Zen and Go (same adapter module, different ids) keep running.
+   */
+  readonly retired: boolean;
 }
 
 /** Normalizes optional identity defaults once before any provider lookup. */
@@ -588,6 +599,7 @@ export const BUNDLED_PROVIDER_METADATA: readonly BundledProviderMetadata[] = RAW
     "jwtVerification" in definition ? definition.jwtVerification : {};
   const bespokeWire = Boolean("bespokeWire" in definition && definition.bespokeWire);
   const hasAdapterUserAgent = "hasAdapterUserAgent" in definition && definition.hasAdapterUserAgent === true;
+  const retired = Boolean("retired" in definition && definition.retired);
   const serviceKinds: readonly ServiceKind[] = "serviceKinds" in definition ? definition.serviceKinds : ["llm"];
   return {
     ...definition,
@@ -599,5 +611,6 @@ export const BUNDLED_PROVIDER_METADATA: readonly BundledProviderMetadata[] = RAW
     jwtVerification,
     bespokeWire,
     hasAdapterUserAgent,
+    retired,
   };
 });

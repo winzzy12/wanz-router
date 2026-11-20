@@ -708,7 +708,16 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     );
   }
 
-  app.all("/", serveDashboard);
+  // The public landing page is retired: the root URL redirects straight to the
+  // console so clients land on the authenticated dashboard (login/setup on
+  // first boot) instead of a marketing card. Query strings are preserved.
+  app.all("/", ({ request }) => {
+    const query = new URL(request.url).search;
+    return new Response(null, {
+      status: 301,
+      headers: { location: `/console${query}` },
+    });
+  });
   app.all("/share", serveDashboard);
   app.all("/share/*", serveDashboard);
   app.all("/console", serveDashboard);

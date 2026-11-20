@@ -30,7 +30,7 @@ export const OPENCODE_SDK_CHOICES: readonly SdkChoice[] = [
     id: "@opencode/ai/providers/openai-compatible",
     label: "OpenAI Compatible",
     protocol: "openai-compatible",
-    description: "OpenAI chat-completions wire — the default for a gateway like Cartethyia.",
+    description: "OpenAI chat-completions wire — the default for a gateway like Wanz Router.",
   },
   {
     id: "@opencode/ai/providers/openai/responses",

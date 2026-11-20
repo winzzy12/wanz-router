@@ -252,10 +252,10 @@ export default function Setup(): ReactNode {
 
   return (
     <AuthLayout
-      title="Cartethyia Console Setup"
+      title="Wanz Router Console Setup"
       description={
         mode === "create"
-          ? "Configure the administrator account for Cartethyia AI Gateway"
+          ? "Configure the administrator account for Wanz Router AI Gateway"
           : "Restore a previous installation's settings and create the administrator account"
       }
     >

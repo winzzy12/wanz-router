@@ -521,7 +521,7 @@ export function BackupPanel(): ReactNode {
                 Detected format:{" "}
                 {format === "nine_router"
                   ? "router export"
-                  : "Cartethyia backup"}
+                  : "Wanz Router backup"}
               </p>
             ) : null}
             {restored !== null ? (

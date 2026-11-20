@@ -90,7 +90,7 @@ export default function Login(): ReactNode {
 
   if (checkingSetup) {
     return (
-      <AuthLayout title="Cartethyia Console" description="Checking console setup...">
+      <AuthLayout title="Wanz Router Console" description="Checking console setup...">
         <div className="flex flex-col gap-7" aria-hidden="true">
           <div className="h-20 rounded-control bg-surface-2 animate-pulse" />
           <div className="h-20 rounded-control bg-surface-2 animate-pulse" />
@@ -102,7 +102,7 @@ export default function Login(): ReactNode {
 
   return (
     <AuthLayout
-      title="Cartethyia Console"
+      title="Wanz Router Console"
       description="Sign in to manage AI Gateway routing and providers"
     >
       <form onSubmit={submit} className="flex flex-col gap-7">

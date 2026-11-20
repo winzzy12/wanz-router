@@ -285,7 +285,7 @@ export function LandingPage(): ReactElement {
               <img className="size-full rounded-lg object-cover" src={`${ASSET_BASE}assets/brand/favicon.webp`} alt="" />
             </span>
             <span>
-              <strong className="block font-heading text-lead leading-none">Cartethyia</strong>
+              <strong className="block font-heading text-lead leading-none">Wanz Router</strong>
               <small className="mt-1 block font-mono text-micro font-medium leading-none tracking-code text-story-white/50">AI PROXY ROUTER</small>
             </span>
           </a>

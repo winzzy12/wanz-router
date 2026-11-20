@@ -746,7 +746,7 @@ export function DashboardShell({
             <div aria-hidden="true" className="brand-icon overflow-hidden p-0">
               <img
                 src={logoUrl}
-                alt="Cartethyia"
+                alt="Wanz Router"
                 onError={(event) => {
                   event.currentTarget.onerror = null;
                   event.currentTarget.src = defaultLogoUrl;
@@ -756,7 +756,7 @@ export function DashboardShell({
             </div>
             <div className="brand-meta">
               <div className="brand-name">
-                <span>Cartethyia</span>
+                <span>Wanz Router</span>
               </div>
               <div className="brand-version-badge">
                 <a href={GITHUB_RELEASES_URL} target="_blank" rel="noreferrer" className="brand-version-link">{DASHBOARD_RELEASE_LABEL}</a>
@@ -772,7 +772,7 @@ export function DashboardShell({
                     className="brand-update-badge"
                     title={
                       latestTag === undefined
-                        ? "A newer Cartethyia release is available"
+                        ? "A newer Wanz Router release is available"
                         : `Update available: v${latestTag} — how to install it`
                     }
                   >

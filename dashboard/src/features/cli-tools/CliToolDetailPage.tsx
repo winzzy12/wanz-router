@@ -431,7 +431,7 @@ function CliToolDetailBody({
 
   // Live JSON preview of what would be written, mirroring the injector's
   // shape (one provider entry named `cartethyia`, everything else preserved).
-  // Model entries are enriched from the Cartethyia catalog — limit, cost,
+  // Model entries are enriched from the Wanz Router catalog — limit, cost,
   // capabilities (tools / input / output / reasoning / vision) are taken from
   // the roster when known, not invented.
   const previewConfig = useMemo(() => {
@@ -686,13 +686,13 @@ function CliToolDetailBody({
                         value={websearchProvider}
                         onValueChange={setWebsearchProvider}
                         options={[
-                          { value: "carte", label: "Via Cartethyia (default)" },
+                          { value: "carte", label: "Via Wanz Router (default)" },
                           { value: "random", label: "Native OpenCode Console" },
                         ]}
                       />
                       <p className="text-micro text-text-tertiary m-0">
                         {websearchProvider === "carte"
-                          ? "Search routes through the Cartethyia gateway — no extra key needed."
+                          ? "Search routes through the Wanz Router gateway — no extra key needed."
                           : "OpenCode's own provider selection (may require an API key or Console billing)."}
                       </p>
                     </div>
@@ -791,7 +791,7 @@ function CliToolDetailBody({
 
               <p className="text-badge text-text-tertiary m-0">
                 {tool.mappingSupported
-                  ? "Left is the model name the CLI asks for. Right is the route Cartethyia sends it to. Leave a target empty to send that slot straight to the provider."
+                  ? "Left is the model name the CLI asks for. Right is the route Wanz Router sends it to. Leave a target empty to send that slot straight to the provider."
                   : "The model names written into this tool's config."}
               </p>
 
@@ -805,7 +805,7 @@ function CliToolDetailBody({
                 <div className="mb-5 flex items-center gap-4 rounded-inset border border-inner-border bg-surface-2 px-5 py-3 text-micro text-text-tertiary">
                   <span className="flex-1">CLI asks for</span>
                   <span className="w-9 text-center">→</span>
-                  <span className="flex-1">Cartethyia routes to</span>
+                  <span className="flex-1">Wanz Router routes to</span>
                 </div>
               ) : null}
 

@@ -251,7 +251,7 @@ function RemoteSupportCard() {
             recorded as loopback.
           </p>
           <p className="text-badge leading-normal text-text-tertiary">
-            Cartethyia doesn&apos;t install cloudflared or Tailscale for you — set up either one
+            Wanz Router doesn&apos;t install cloudflared or Tailscale for you — set up either one
             yourself. Tunnels run detached from the gateway, so they keep working across restarts.
           </p>
         </Stack>

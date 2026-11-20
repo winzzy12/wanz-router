@@ -16,7 +16,7 @@ import "../../styles/app.css";
  * here and nothing can block the mount.
  */
 export function mountConsole(root: HTMLElement): void {
-  document.title = "Cartethyia Console";
+  document.title = "Wanz Router Console";
   void restorePersistedCache().finally(() => {
     startPersisting();
     createRoot(root).render(

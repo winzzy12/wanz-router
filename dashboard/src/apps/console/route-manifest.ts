@@ -63,7 +63,7 @@ export interface ProviderRouteLabel {
 
 export const CONSOLE_FALLBACK: ConsoleRouteMeta = {
   title: "Console",
-  sub: "Cartethyia AI Gateway Administration",
+  sub: "Wanz Router AI Gateway Administration",
   icon: LayoutDashboard,
 };
 

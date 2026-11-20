@@ -366,7 +366,7 @@ function AddCompatibleModal({
           {pastedEndpoint === null ? null : (
             <p className="mt-1.5 text-caption text-orange">
               That looks like a full endpoint. Use{" "}
-              <code className="font-mono">{pastedEndpoint}</code> instead — Cartethyia appends the
+              <code className="font-mono">{pastedEndpoint}</code> instead — Wanz Router appends the
               endpoint path itself.
             </p>
           )}

@@ -112,7 +112,7 @@ export function UpdateDialog({
       open={open}
       onClose={onClose}
       title="Update available"
-      description={`Cartethyia ${target} is available; this install runs ${currentVersion}.`}
+      description={`Wanz Router ${target} is available; this install runs ${currentVersion}.`}
       size="md"
       footer={
         <DialogActions>
@@ -179,7 +179,7 @@ export function UpdateDialog({
             <TriangleAlert size={14} aria-hidden="true" />
           </span>
           <p className="text-badge text-text-secondary min-w-0">
-            npm cannot replace the package while Cartethyia is running from it, so this
+            npm cannot replace the package while Wanz Router is running from it, so this
             cannot update itself the way a single-binary tool can. That is why the console
             gives you the command instead of a button that installs.
           </p>
@@ -220,7 +220,7 @@ export function UpdateDialog({
       <div className="fixed inset-0 z-toast grid place-items-center bg-black/70 backdrop-blur-sm">
         <div className="flex flex-col items-center gap-4 text-white">
           <Loader2 size={40} className="animate-spin" aria-hidden="true" />
-          <p className="text-lg font-semibold">Updating Cartethyia…</p>
+          <p className="text-lg font-semibold">Updating Wanz Router…</p>
           <p className="text-sm opacity-80">Do not refresh or close this page.</p>
         </div>
       </div>

@@ -242,7 +242,7 @@ export function SharePage(): ReactElement {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
   useEffect(() => {
-    document.title = "Cartethyia — Shared access";
+    document.title = "Wanz Router — Shared access";
     // The public share surface owns no theme of its own: it applies the console
     // `console-theme` preference through the same helper the console uses, so
     // both apps on this origin always resolve to the same tokens. The bootstrap
@@ -313,7 +313,7 @@ export function SharePage(): ReactElement {
         setStorageWarning("Your key was issued, but this browser could not save it. Copy it now: refreshing will not restore it.");
       }
     } catch {
-      setIssueError("Unable to reach the Cartethyia gateway. Please try again.");
+      setIssueError("Unable to reach the Wanz Router gateway. Please try again.");
     } finally { setIssueBusy(false); }
   };
   const visibleSecret = restoredSecret ?? secret;
@@ -425,7 +425,7 @@ export function SharePage(): ReactElement {
                 height={34}
               />
             </span>
-            <b>Cartethyia</b>
+            <b>Wanz Router</b>
           </a>
           <div className="inline-flex items-center gap-4 max-narrow:gap-3">
             <GithubBadge className="max-narrow:[&_.github-badge-metric]:hidden max-narrow:[&_.github-badge]:px-2.5" />
@@ -529,8 +529,8 @@ export function SharePage(): ReactElement {
                           size="sm"
                           onClick={() =>
                             downloadTextFile(
-                              "cartethyia-api-key.txt",
-                              `Cartethyia API key\n\n${handoffKey}\n\nKeep this secret.\n`,
+                              "wanz-router-api-key.txt",
+                              `Wanz Router API key\n\n${handoffKey}\n\nKeep this secret.\n`,
                               "text/plain;charset=utf-8",
                             )
                           }
@@ -566,8 +566,8 @@ export function SharePage(): ReactElement {
                         size="sm"
                         onClick={() =>
                           downloadTextFile(
-                            "cartethyia-api-key.txt",
-                            `Cartethyia API key\n\n${visibleSecret.key}\n\nKeep this secret.\n`,
+                            "wanz-router-api-key.txt",
+                            `Wanz Router API key\n\n${visibleSecret.key}\n\nKeep this secret.\n`,
                             "text/plain;charset=utf-8",
                           )
                         }

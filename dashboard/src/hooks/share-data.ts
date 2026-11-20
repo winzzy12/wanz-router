@@ -158,7 +158,7 @@ export function useShareData<TData>(
         })
         .catch((error: unknown) => {
           if (error instanceof DOMException && error.name === "AbortError") return;
-          if (active) setState({ data: null, error: "Unable to reach the Cartethyia gateway.", code: null, loading: false });
+          if (active) setState({ data: null, error: "Unable to reach the Wanz Router gateway.", code: null, loading: false });
         });
     }
     return () => { active = false; controller.abort(); };

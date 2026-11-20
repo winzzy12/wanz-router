@@ -901,44 +901,6 @@ main > .state-viewport {
   gap: 20px;
 }
 
-.auth-brand-links-label {
-  display: block;
-  text-align: center;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-tertiary);
-}
-
-.auth-brand-links-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.auth-brand-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 34px;
-  padding: 0 10px;
-  border: 1px solid var(--inner-border);
-  border-radius: var(--radius-control);
-  background: var(--surface-2);
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  text-decoration: none;
-  transition: border-color 120ms ease, color 120ms ease;
-}
-
-.auth-brand-link:hover {
-  border-color: var(--border-strong);
-  color: var(--text-primary);
-}
-
 @media (max-width: 940px) {
   /* Standalone auth surfaces: the key art is pinned to the viewport and never
      moves, and the form floats as a fixed centered card above it. */

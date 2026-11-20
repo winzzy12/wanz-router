@@ -1,11 +1,4 @@
 import type { ReactNode } from "react";
-import { MarkFor } from "../../components/patterns/github-badge";
-import { SOURCE_LINKS } from "../../lib/links";
-
-/** Only the primary destination links: no historical mirror or GitLab mirror. */
-const AUTH_SOURCE_LINKS = SOURCE_LINKS.filter(
-  (link) => link.id !== "github-alt" && link.id !== "gitlab",
-);
 
 interface AuthLayoutProps {
   readonly title: string;
@@ -20,10 +13,9 @@ interface AuthLayoutProps {
 /**
  * Shared auth frame for login, setup, and banned surfaces.
  *
- * Full-bleed key art: the image covers the entire viewport edge to edge, and
- * the brand block + form float on a frosted-glass panel at the right edge.
- * On narrow screens the panel centers as a card over the image. Inside the
- * console shell (error boundary) the split falls back to a solid gradient.
+ * A centered card on the page background — the brand block + form, no key art
+ * and no distribution links. Inside the console shell (error boundary) the
+ * split falls back to a solid gradient.
  */
 export default function AuthLayout({
   title,
@@ -46,25 +38,6 @@ export default function AuthLayout({
           </div>
 
           <div className="auth-form-body">{children}</div>
-
-          <nav className="auth-hero-links" aria-label="Public source and distribution links">
-            <span className="auth-brand-links-label">Get Cartethyia</span>
-            <div className="auth-brand-links-grid">
-              {AUTH_SOURCE_LINKS.map((link) => (
-                <a
-                  key={link.id}
-                  className="auth-brand-link"
-                  href={link.href}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={link.hint}
-                >
-                  <MarkFor id={link.id} size={15} />
-                  <span>{link.label}</span>
-                </a>
-              ))}
-            </div>
-          </nav>
         </div>
       </section>
     </main>

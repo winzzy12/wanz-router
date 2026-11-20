@@ -34,6 +34,7 @@ const Setup = lazyWithRetry(() => import("./features/session/SetupPage"), "setup
 const Banned = lazyWithRetry(() => import("./features/session/BannedPage"), "banned");
 const Overview = lazyWithRetry(() => import("./features/overview/OverviewPage"), "overview");
 const Usage = lazyWithRetry(() => import("./features/usage/UsagePage"), "usage");
+const LiveRequests = lazyWithRetry(() => import("./features/live-requests/LiveRequestsPage"), "live-requests");
 const ProviderDetail = lazyWithRetry(() => import("./features/provider-detail/ProviderDetailPage"), "provider-detail");
 const Providers = lazyWithRetry(() => import("./features/providers/ProvidersPage"), "providers");
 const Combos = lazyWithRetry(() => import("./features/routing/CombosPage"), "combos");
@@ -179,6 +180,8 @@ function ProtectedRoutes(): ReactNode {
               return <Route key={route.key} path={route.path} element={<Overview />} />;
             case "usage":
               return <Route key={route.key} path={route.path} element={<Usage />} />;
+            case "live-requests":
+              return <Route key={route.key} path={route.path} element={<LiveRequests />} />;
             case "providers":
               return <Route key={route.key} path={route.path} element={<Providers />} />;
             case "provider-detail":

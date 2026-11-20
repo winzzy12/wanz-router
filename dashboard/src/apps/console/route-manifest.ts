@@ -10,12 +10,14 @@ import {
   Settings as SettingsIcon,
   ShieldAlert,
   Terminal,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 
 export type ConsoleRouteKey =
   | "overview"
   | "usage"
+  | "live-requests"
   | "providers"
   | "provider-detail"
   | "combos"
@@ -85,6 +87,15 @@ export const CONSOLE_ROUTE_SPECS: readonly ConsoleRouteSpec[] = [
     title: "Usage & Metrics",
     sub: "Token economics, requests, and cost breakdown",
     icon: Activity,
+  },
+  {
+    key: "live-requests",
+    path: "/live-requests",
+    navGroup: "Main",
+    navLabel: "Live Requests",
+    title: "Live Requests",
+    sub: "Real-time request feed, refreshed every second",
+    icon: Zap,
   },
   {
     key: "providers",

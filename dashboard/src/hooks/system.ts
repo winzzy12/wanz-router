@@ -180,6 +180,7 @@ export function useUsageRequests(
   period: string,
   limit = 50,
   httpStatus?: number | null,
+  refetchInterval: number | false = POLL.live,
 ) {
   const statusParam = httpStatus === null || httpStatus === undefined
     ? ""
@@ -197,7 +198,7 @@ export function useUsageRequests(
     // treated as a brand-new query with no data: the table empties, the scroll
     // container collapses, and the operator is thrown back to the top.
     placeholderData: (previous) => previous,
-    refetchInterval: POLL.live,
+    refetchInterval,
   });
 }
 

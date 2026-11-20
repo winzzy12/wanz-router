@@ -1,0 +1,685 @@
+/**
+ * The canonical telemetry reader.
+ *
+ * `telemetry_events` is already written by the production path (the
+ * transactional `insertEvents`), is indexed for keyset pagination and
+ * tenant-scoped breakdowns, and carries exactly the bounded metadata fields
+ * the console aggregates over — bodies live only in payload frame files. It
+ * is therefore the analytics source: every function here runs its aggregate
+ * IN SQL and returns only totals, groups, or buckets, so no read materializes
+ * the retained window in JavaScript.
+ *
+ * Rules enforced here:
+ * - every statement is tenant-scoped and `created_at >= since`;
+ * - list/detail use `(created_at, id)` keyset pagination, newest first;
+ * - latency percentiles are computed by the database (Postgres
+ *   `percentile_cont`, SQLite nearest-rank via ordered OFFSET/LIMIT) —
+ *   latency arrays are never returned to JavaScript;
+ * - `isGatewayError()` semantics live in one shared SQL predicate.
+ */
+import { and, desc, eq, gte, isNotNull, sql } from "drizzle-orm";
+import type { CartethyiaDatabase } from "../persistence/db-handle";
+import { telemetryEvents, telemetryUsageTotals } from "../persistence/schema";
+import type { TelemetryEventRecord } from "./event-log";
+import {
+  AGGREGATE_SELECT,
+  CACHED_INPUT_TOKENS_SQL,
+  bucketExpression,
+  familyKeyCondition,
+  idMembershipFilter,
+  isPostgres,
+  numeric,
+  numericNullable,
+  scoped,
+} from "./event-query-helpers";
+import type {
+  BreakdownGroup,
+  ChartBucket,
+  EventListQuery,
+  EventPage,
+  ProviderUsageDayRow,
+  UsageSummary,
+} from "./event-query-types";
+
+export { IS_GATEWAY_ERROR_SQL, TelemetryQueryInputError } from "./event-query-helpers";
+export type { ChartBucket, EventPage, ProviderUsageDayRow, UsageSummary } from "./event-query-types";
+
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 500;
+
+/** Maps one `telemetry_events` row to the console's record shape. */
+function eventRecordFromRow(row: {
+  readonly id: string | null;
+  readonly createdAt: Date;
+  readonly tenantId: string;
+  readonly requestId: string;
+  readonly sourceSurface: string | null;
+  readonly requestedModel: string | null;
+  readonly reportedModel: string | null;
+  readonly requestedEffort: string | null;
+  readonly providerId: string | null;
+  readonly accountId: string | null;
+  readonly networkPoolId: string | null;
+  readonly endpoint: string | null;
+  readonly apiKeyId: string | null;
+  readonly userAgent: string | null;
+  readonly clientName: string | null;
+  readonly clientIp: string | null;
+  readonly latencyMs: number | null;
+  readonly ttfbMs: number | null;
+  readonly stream: boolean | null;
+  readonly status: string | null;
+  readonly httpStatus: number | null;
+  readonly errorOrigin: string | null;
+  readonly errorCategory: string | null;
+  readonly inputTokens: number | null;
+  readonly cachedInputTokens: number | null;
+  readonly outputTokens: number | null;
+  readonly reasoningTokens: number | null;
+  readonly estimatedCostUsd: string | number | null;
+  readonly creditUsed: string | number | null;
+  readonly resolveMs: number | null;
+  readonly tokensPerSec: string | number | null;
+  readonly firstContentDeltaAtMs: number | null;
+  readonly lastEventAtMs: number | null;
+  readonly payloadCaptureState: string | null;
+  readonly degenerateStop: boolean | null;
+}): TelemetryEventRecord {
+  return {
+    id: row.id ?? row.requestId,
+    createdAt: new Date(row.createdAt).toISOString(),
+    tenantId: row.tenantId,
+    requestId: row.requestId,
+    sourceSurface: row.sourceSurface,
+    requestedModel: row.requestedModel,
+    reportedModel: row.reportedModel,
+    requestedEffort: row.requestedEffort,
+    providerId: row.providerId,
+    accountId: row.accountId,
+    networkPoolId: row.networkPoolId,
+    endpoint: row.endpoint,
+    apiKeyId: row.apiKeyId,
+    userAgent: row.userAgent,
+    clientIp: row.clientIp,
+    latencyMs: row.latencyMs,
+    ttfbMs: row.ttfbMs,
+    stream: row.stream,
+    status: row.status,
+    httpStatus: row.httpStatus,
+    errorOrigin: row.errorOrigin,
+    errorCategory: row.errorCategory,
+    inputTokens: row.inputTokens,
+    cachedInputTokens: row.cachedInputTokens,
+    outputTokens: row.outputTokens,
+    reasoningTokens: row.reasoningTokens,
+    estimatedCostUsd: numericNullable(row.estimatedCostUsd),
+    creditUsed: numericNullable(row.creditUsed),
+    resolveMs: row.resolveMs,
+    tokensPerSec: numericNullable(row.tokensPerSec),
+    firstContentDeltaAtMs: row.firstContentDeltaAtMs,
+    lastEventAtMs: row.lastEventAtMs,
+    payloadCaptureState: row.payloadCaptureState,
+    ...(row.degenerateStop === true ? { degenerateStop: true } : {}),
+  };
+}
+
+/**
+ * Bounded detail/list read — the only place rows are materialized.
+ *
+ * Keyset pagination on `(created_at DESC, id DESC)`: `created_at` has
+ * second resolution, so a cursor on it alone could skip or repeat rows at a
+ * boundary. The cursor is the last row of the page, encoded as
+ * `{createdAtMs}|{id}`.
+ */
+export async function queryTelemetryEvents(
+  db: CartethyiaDatabase,
+  query: EventListQuery,
+): Promise<EventPage> {
+  const limit = Math.max(1, Math.min(MAX_LIMIT, Math.trunc(query.limit ?? DEFAULT_LIMIT)));
+  const conditions = [scoped(query.tenantId, query.since)];
+  if (query.until !== undefined) {
+    conditions.push(sql`${telemetryEvents.createdAt} < ${query.until}`);
+  }
+  if (query.apiKeyIds !== undefined) {
+    conditions.push(idMembershipFilter(db, telemetryEvents.apiKeyId, query.apiKeyIds, "uuid[]"));
+  }
+  if (query.familyApiKeyId !== undefined) {
+    conditions.push(familyKeyCondition(query.familyApiKeyId));
+  }
+  if (query.accountIds !== undefined) {
+    conditions.push(idMembershipFilter(db, telemetryEvents.accountId, query.accountIds, "uuid[]"));
+  }
+  if (query.requestId !== undefined) {
+    conditions.push(eq(telemetryEvents.requestId, query.requestId));
+  }
+  if (query.requestIds !== undefined) {
+    conditions.push(idMembershipFilter(db, telemetryEvents.requestId, query.requestIds, "text[]"));
+  }
+  if (query.id !== undefined) {
+    conditions.push(eq(telemetryEvents.id, query.id));
+  }
+  if (query.httpStatus !== undefined) {
+    conditions.push(eq(telemetryEvents.httpStatus, query.httpStatus));
+  }
+  if (query.cursor !== undefined) {
+    const separator = query.cursor.indexOf("|");
+    const at = Number(query.cursor.slice(0, separator));
+    const id = query.cursor.slice(separator + 1);
+    if (Number.isFinite(at) && id.length > 0) {
+      conditions.push(
+        sql`(${telemetryEvents.createdAt} < ${new Date(at)} OR (${telemetryEvents.createdAt} = ${new Date(at)} AND ${telemetryEvents.id} < ${id}))`,
+      );
+    }
+  }
+
+  const rows = await db
+    .select()
+    .from(telemetryEvents)
+    .where(and(...conditions))
+    .orderBy(desc(telemetryEvents.createdAt), desc(telemetryEvents.id))
+    .limit(limit + 1);
+
+  const page = rows.slice(0, limit);
+  const hasMore = rows.length > limit;
+  const last = page[page.length - 1];
+  const events = page.map((row) => eventRecordFromRow(row as Parameters<typeof eventRecordFromRow>[0]));
+  return {
+    events,
+    ...(hasMore && last
+      ? {
+          nextCursor: `${new Date(last.createdAt as unknown as Date).getTime()}|${last.id ?? last.requestId}`,
+        }
+      : {}),
+  };
+}
+
+type Percentiles = { p50: number | null; p95: number | null; p99: number | null };
+
+async function latencyPercentiles(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  since: Date,
+  sampled: number,
+): Promise<Percentiles> {
+  const empty: Percentiles = { p50: null, p95: null, p99: null };
+  if (sampled <= 0) return empty;
+  const base = [scoped(tenantId, since), isNotNull(telemetryEvents.latencyMs)];
+
+  // Postgres: one statement computing all three continuous percentiles.
+  if (isPostgres(db)) {
+    const [row] = await db
+      .select({
+        p50: sql<number>`percentile_cont(0.50) within group (order by ${telemetryEvents.latencyMs})`,
+        p95: sql<number>`percentile_cont(0.95) within group (order by ${telemetryEvents.latencyMs})`,
+        p99: sql<number>`percentile_cont(0.99) within group (order by ${telemetryEvents.latencyMs})`,
+      })
+      .from(telemetryEvents)
+      .where(and(...base));
+    if (!row) return empty;
+    return {
+      p50: numericNullable(row.p50),
+      p95: numericNullable(row.p95),
+      p99: numericNullable(row.p99),
+    };
+  }
+
+  // SQLite: nearest-rank percentile = the value at ceil(p * n) rows into the
+  // ordered latency column. One query computes all three ranks via a window
+  // function, instead of three separate OFFSET/LIMIT passes over the same
+  // ordered column (one per percentile).
+  const n = Math.max(1, sampled);
+  const ranks = [
+    Math.ceil(0.5 * n),
+    Math.ceil(0.95 * n),
+    Math.ceil(0.99 * n),
+  ];
+  const [row] = await db
+    .select({
+      p50: sql<number | null>`max(case when rn = ${ranks[0]} then value end)`,
+      p95: sql<number | null>`max(case when rn = ${ranks[1]} then value end)`,
+      p99: sql<number | null>`max(case when rn = ${ranks[2]} then value end)`,
+    })
+    .from(
+      sql`(
+        select ${telemetryEvents.latencyMs} as value,
+               row_number() over (order by ${telemetryEvents.latencyMs}) as rn
+        from ${telemetryEvents}
+        where ${and(...base)}
+      )`,
+    );
+  return {
+    p50: numericNullable(row?.p50 ?? null),
+    p95: numericNullable(row?.p95 ?? null),
+    p99: numericNullable(row?.p99 ?? null),
+  };
+}
+
+function dimensionColumn(dimension: string) {
+  if (dimension === "model") return telemetryEvents.requestedModel;
+  if (dimension === "provider") return telemetryEvents.providerId;
+  if (dimension === "account") return telemetryEvents.accountId;
+  if (dimension === "api_key" || dimension === "key") return telemetryEvents.apiKeyId;
+  if (dimension === "client") return telemetryEvents.clientName;
+  // `client_ip` groups on the raw address; masking stays a post-grouping
+  // presentation step in the console, unchanged.
+  if (dimension === "client_ip" || dimension === "ip") return telemetryEvents.clientIp;
+  if (dimension === "status") return telemetryEvents.httpStatus;
+  if (dimension === "endpoint") return telemetryEvents.endpoint;
+  return telemetryEvents.requestedModel;
+}
+
+/** The dimension's raw value as a string, for the console's grouping step. */
+function dimensionValue(raw: unknown): string {
+  const value = raw === null || raw === undefined ? "" : String(raw);
+  return value.length === 0 ? "unknown" : value;
+}
+
+/**
+ * One dimension's groups, at most 100, ordered by request count.
+ *
+ * Grouping happens in SQL; only the groups come back. `client` groups on the
+ * ingestion-stamped `client_name` rather than re-deriving a name per row in
+ * JavaScript, and `client_ip` masking stays a post-grouping presentation step.
+ */
+export async function breakdownTelemetry(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  dimension: string,
+  since: Date,
+): Promise<BreakdownGroup[]> {
+  const column = dimensionColumn(dimension);
+  const rows = await db
+    .select({
+      key: column,
+      requests: sql<number>`count(*)`,
+      ...AGGREGATE_SELECT,
+      costUsd: sql<number>`coalesce(sum(${telemetryEvents.estimatedCostUsd}), 0)`,
+      avgTokensPerSec: sql<number>`coalesce(avg(${telemetryEvents.tokensPerSec}), 0)`,
+    })
+    .from(telemetryEvents)
+    .where(scoped(tenantId, since))
+    .groupBy(column)
+    .orderBy(desc(sql`count(*)`))
+    .limit(100);
+  return rows.map((row) => ({
+    key: dimensionValue(row.key),
+    requests: numeric(row.requests),
+    errors: numeric(row.errors),
+    inputTokens: numeric(row.inputTokens),
+    outputTokens: numeric(row.outputTokens),
+    cachedInputTokens: numeric(row.cachedInputTokens),
+    // A group whose rows carried no price reports null, matching the console's
+    // "cost is unknown" reading rather than a false zero.
+    costUsd: numeric(row.costUsd) > 0 ? numeric(row.costUsd) : null,
+    avgTokensPerSec: numeric(row.avgTokensPerSec),
+  }));
+}
+
+/**
+ * Time-series buckets, computed in SQL.
+ *
+ * Bucket width comes from the caller (the console's existing period rule); the
+ * epoch bucketing is portable — `to_timestamp`/`unixepoch` differences are
+ * handled per backend.
+ */
+export async function chartTelemetry(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  since: Date,
+  bucketSeconds: number,
+): Promise<ChartBucket[]> {
+  const bucketExpr = bucketExpression(db, telemetryEvents.createdAt, bucketSeconds);
+  const rows = await db
+    .select({
+      at: bucketExpr,
+      requests: sql<number>`count(*)`,
+      ...AGGREGATE_SELECT,
+    })
+    .from(telemetryEvents)
+    .where(scoped(tenantId, since))
+    .groupBy(bucketExpr);
+  return rows.map((row) => ({
+    at: numeric(row.at) * 1000,
+    requests: numeric(row.requests),
+    errors: numeric(row.errors),
+    inputTokens: numeric(row.inputTokens),
+    outputTokens: numeric(row.outputTokens),
+    cachedInputTokens: numeric(row.cachedInputTokens),
+  }));
+}
+
+/**
+ * Per-provider daily usage grouped by `requested_model`, day-bucketed like
+ * {@link chartTelemetry} but with a second grouping dimension (requested
+ * model) and the totals the tooltip/summary strip need. Provider rows carry
+ * no catalog foreign keys, so an unknown or deleted provider id returns empty
+ * rather than erroring.
+ */
+export async function providerUsageMatrix(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  providerId: string,
+  since: Date,
+): Promise<ProviderUsageDayRow[]> {
+  const dayExpression = bucketExpression(db, telemetryEvents.createdAt, 86400);
+  const rows = await db
+    .select({
+      day: dayExpression,
+      model: telemetryEvents.requestedModel,
+      requests: sql<number>`count(*)`,
+      inputTokens: AGGREGATE_SELECT.inputTokens,
+      cachedInputTokens: CACHED_INPUT_TOKENS_SQL,
+      outputTokens: AGGREGATE_SELECT.outputTokens,
+      costUsd: sql<number>`coalesce(sum(${telemetryEvents.estimatedCostUsd}), 0)`,
+    })
+    .from(telemetryEvents)
+    .where(and(scoped(tenantId, since), eq(telemetryEvents.providerId, providerId)))
+    .groupBy(dayExpression, telemetryEvents.requestedModel)
+    .orderBy(dayExpression);
+  return rows.map((row) => ({
+    day: new Date(numeric(row.day) * 1000).toISOString().slice(0, 10),
+    model: row.model,
+    requests: numeric(row.requests),
+    inputTokens: numeric(row.inputTokens),
+    cachedInputTokens: numeric(row.cachedInputTokens),
+    outputTokens: numeric(row.outputTokens),
+    costUsd: numeric(row.costUsd),
+  }));
+}
+
+/**
+ * Summed input+output tokens for a set of API keys over one window — the
+ * family bucket spend query.
+ */
+export async function sumTelemetryTokens(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  filters: {
+    readonly apiKeyIds?: readonly string[];
+    /** The share-template family filter; see {@link EventListQuery.familyApiKeyId}. */
+    readonly familyKeyId?: string;
+    readonly since: Date;
+    readonly until?: Date;
+  },
+): Promise<number> {
+  const conditions = [scoped(tenantId, filters.since)];
+  if (filters.until !== undefined) {
+    conditions.push(sql`${telemetryEvents.createdAt} < ${filters.until}`);
+  }
+  if (filters.apiKeyIds !== undefined && filters.apiKeyIds.length > 0) {
+    conditions.push(idMembershipFilter(db, telemetryEvents.apiKeyId, filters.apiKeyIds, "uuid[]"));
+  }
+  if (filters.familyKeyId !== undefined) {
+    conditions.push(familyKeyCondition(filters.familyKeyId));
+  }
+  const [row] = await db
+    .select({
+      total: sql<number>`coalesce(sum(coalesce(${telemetryEvents.inputTokens}, 0) + coalesce(${telemetryEvents.outputTokens}, 0)), 0)`,
+    })
+    .from(telemetryEvents)
+    .where(and(...conditions));
+  return numeric(row?.total ?? 0);
+}
+
+/**
+ * All-time family counts from the durable rollup, not from a scan of the
+ * retained telemetry window.
+ *
+ * The share KPI cards need lifetime numbers. `telemetry_usage_totals` is
+ * charged at write time and accumulates per identity, so a family's lifetime
+ * requests/errors/tokens are a SUM over its rows (keyed by
+ * `family_template_key_id`) — sub-millisecond on a small table, versus a
+ * full-window aggregate over `telemetry_events` that reads every retained
+ * event on every tick. The rollup is the same definition as the read-side
+ * counts, so the two cannot drift.
+ */
+interface FamilyKpiTotals {
+  readonly requests: number;
+  readonly errors: number;
+  readonly tokens: number;
+}
+
+/** Sums one share family's durable lifetime totals. */
+export async function familyKpiTotals(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  familyKeyId: string,
+): Promise<FamilyKpiTotals> {
+  const [row] = await db
+    .select({
+      requests: sql<number>`coalesce(sum(${telemetryUsageTotals.requests}), 0)`,
+      errors: sql<number>`coalesce(sum(${telemetryUsageTotals.errors}), 0)`,
+      tokens: sql<number>`coalesce(sum(coalesce(${telemetryUsageTotals.inputTokens}, 0) + coalesce(${telemetryUsageTotals.outputTokens}, 0)), 0)`,
+    })
+    .from(telemetryUsageTotals)
+    .where(
+      and(
+        eq(telemetryUsageTotals.tenantId, tenantId),
+        eq(telemetryUsageTotals.familyTemplateKeyId, familyKeyId),
+      ),
+    );
+  return {
+    requests: numeric(row?.requests ?? 0),
+    errors: numeric(row?.errors ?? 0),
+    tokens: numeric(row?.tokens ?? 0),
+  };
+}
+
+/** Counts one share family's requests in a bounded window — a range scan, not a full-window aggregate. */
+export async function familyWindowRequests(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  familyKeyId: string,
+  since: Date,
+): Promise<number> {
+  const [row] = await db
+    .select({
+      requests: sql<number>`count(*)`,
+    })
+    .from(telemetryEvents)
+    .where(
+      and(
+        eq(telemetryEvents.tenantId, tenantId),
+        familyKeyCondition(familyKeyId),
+        gte(telemetryEvents.createdAt, since),
+      ),
+    );
+  return numeric(row?.requests ?? 0);
+}
+
+/**
+ * One share family's client-IP breakdown, computed in SQL.
+ *
+ * Unlike the 24-hour page read, this covers a bounded history so an address
+ * that stopped before the last day still appears — marked inactive. The
+ * `active` flag is decided in the caller from `lastSeenAt` vs a cutoff; here
+ * we only aggregate. The window is bounded (`since`, default the whole
+ * retained window) so an unbounded scan is never the default for callers
+ * that only need recent addresses.
+ */
+export async function familyIpBreakdown(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  familyKeyId: string,
+  limit = 50,
+  since?: Date,
+): Promise<{ ip: string; requests: number; tokens: number; lastSeenAt: Date | null }[]> {
+  const conditions = [
+    eq(telemetryEvents.tenantId, tenantId),
+    familyKeyCondition(familyKeyId),
+    ...(since === undefined ? [] : [gte(telemetryEvents.createdAt, since)]),
+  ];
+  const rows = await db
+    .select({
+      ip: telemetryEvents.clientIp,
+      requests: sql<number>`count(*)`,
+      tokens: sql<number>`coalesce(sum(coalesce(${telemetryEvents.inputTokens}, 0) + coalesce(${telemetryEvents.outputTokens}, 0)), 0)`,
+      lastSeenAt: sql<Date>`max(${telemetryEvents.createdAt})`,
+    })
+    .from(telemetryEvents)
+    .where(and(...conditions))
+    .groupBy(telemetryEvents.clientIp)
+    // Highest volume first: the table answers "who has used the link most",
+    // not just who is active right now.
+    .orderBy(desc(sql`count(*)`))
+    .limit(limit);
+  return rows.flatMap((row) =>
+    row.ip === null ? [] : [{ ip: row.ip, requests: numeric(row.requests), tokens: numeric(row.tokens), lastSeenAt: row.lastSeenAt }],
+  );
+}
+
+/**
+ * One share family's time-series buckets, computed in SQL with the family
+ * membership filter.
+ *
+ * Mirrors {@link chartTelemetry} but scoped to a share family. The share page's
+ * 24-hour strip must not be truncated to the bounded page (500 events), or a
+ * busy family's chart undercounts every hour bucket.
+ */
+export async function familyHourlyTelemetry(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  familyKeyId: string,
+  since: Date,
+  bucketSeconds: number,
+): Promise<ChartBucket[]> {
+  const bucketExpr = bucketExpression(db, telemetryEvents.createdAt, bucketSeconds);
+  const conditions = [scoped(tenantId, since), familyKeyCondition(familyKeyId)];
+  const rows = await db
+    .select({
+      at: bucketExpr,
+      requests: sql<number>`count(*)`,
+      ...AGGREGATE_SELECT,
+    })
+    .from(telemetryEvents)
+    .where(and(...conditions))
+    .groupBy(bucketExpr);
+  return rows.map((row) => ({
+    at: numeric(row.at) * 1000,
+    requests: numeric(row.requests),
+    errors: numeric(row.errors),
+    inputTokens: numeric(row.inputTokens),
+    outputTokens: numeric(row.outputTokens),
+    cachedInputTokens: numeric(row.cachedInputTokens),
+  }));
+}
+
+/**
+ * The Usage summary's performance block, computed in SQL.
+ *
+ * Replaces `summarizeUsagePerformance` (which sorted a latency array in
+ * JavaScript): `avg(resolve_ms)` and `avg(tokens_per_sec)` are SQL averages,
+ * and the latency percentiles come from the same database-side percentile
+ * path {@link summarizeUsageWithPerformance} uses.
+ */
+interface UsagePerformanceTotals {
+  readonly avgResolveMs: number;
+  readonly avgDurationMs: number;
+  /**
+   * Percentiles as plain numbers: an empty window reports 0, which is what the
+   * JS-side `summarizeUsagePerformance` reported and what the summary card's
+   * contract expects. (The health reader keeps null so "no samples" stays
+   * distinguishable from a genuine near-zero latency.)
+   */
+  readonly latencyP50Ms: number;
+  readonly latencyP95Ms: number;
+  readonly latencyP99Ms: number;
+  readonly latencySampleCount: number;
+  readonly resolveSampleCount: number;
+  readonly avgTokensPerSec: number;
+}
+
+/**
+ * Combined usage totals + performance in ONE window scan.
+ *
+ * This runs the combined SELECT once and one percentile pass, returning both
+ * shapes so the caller needs no second query.
+ */
+export async function summarizeUsageWithPerformance(
+  db: CartethyiaDatabase,
+  tenantId: string,
+  since: Date,
+): Promise<{ summary: UsageSummary; performance: UsagePerformanceTotals }> {
+  const condition = scoped(tenantId, since);
+  const [row] = await db
+    .select({
+      requests: sql<number>`count(*)`,
+      errors: AGGREGATE_SELECT.errors,
+      cancelled: sql<number>`sum(case when ${telemetryEvents.status} = 'cancelled' then 1 else 0 end)`,
+      truncated: sql<number>`sum(case when ${telemetryEvents.status} = 'truncated' then 1 else 0 end)`,
+      inputTokens: AGGREGATE_SELECT.inputTokens,
+      outputTokens: AGGREGATE_SELECT.outputTokens,
+      cachedInputTokens: CACHED_INPUT_TOKENS_SQL,
+      reasoningTokens: sql<number>`coalesce(sum(${telemetryEvents.reasoningTokens}), 0)`,
+      estimatedCostUsd: sql<number>`coalesce(sum(${telemetryEvents.estimatedCostUsd}), 0)`,
+      sampled: sql<number>`count(${telemetryEvents.latencyMs})`,
+      latencyAvg: sql<number>`avg(${telemetryEvents.latencyMs})`,
+      unpriced: sql<number>`sum(case when ${telemetryEvents.estimatedCostUsd} is null then 1 else 0 end)`,
+      resolveSum: sql<number>`coalesce(sum(${telemetryEvents.resolveMs}), 0)`,
+      resolveCount: sql<number>`count(${telemetryEvents.resolveMs})`,
+      avgTokensPerSec: sql<number>`coalesce(avg(${telemetryEvents.tokensPerSec}), 0)`,
+    })
+    .from(telemetryEvents)
+    .where(condition);
+
+  if (!row) {
+    const empty: UsageSummary = {
+      requests: 0,
+      errors: 0,
+      cancelled: 0,
+      truncated: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+      estimatedCostUsd: 0,
+      sampled: 0,
+      latencyMs: { avg: null, p50: null, p95: null, p99: null },
+      unpriced: 0,
+    };
+    const emptyPerformance: UsagePerformanceTotals = {
+      avgResolveMs: 0,
+      avgDurationMs: 0,
+      latencyP50Ms: 0,
+      latencyP95Ms: 0,
+      latencyP99Ms: 0,
+      latencySampleCount: 0,
+      resolveSampleCount: 0,
+      avgTokensPerSec: 0,
+    };
+    return { summary: empty, performance: emptyPerformance };
+  }
+
+  const sampled = numeric(row.sampled);
+  const percentiles = await latencyPercentiles(db, tenantId, since, sampled);
+  const resolveCount = numeric(row.resolveCount);
+  return {
+    summary: {
+      requests: numeric(row.requests),
+      errors: numeric(row.errors),
+      cancelled: numeric(row.cancelled),
+      truncated: numeric(row.truncated),
+      inputTokens: numeric(row.inputTokens),
+      outputTokens: numeric(row.outputTokens),
+      cachedInputTokens: numeric(row.cachedInputTokens),
+      reasoningTokens: numeric(row.reasoningTokens),
+      estimatedCostUsd: numeric(row.estimatedCostUsd),
+      sampled,
+      latencyMs: {
+        avg: numericNullable(row.latencyAvg),
+        ...percentiles,
+      },
+      unpriced: numeric(row.unpriced),
+    },
+    performance: {
+      avgResolveMs: resolveCount > 0 ? numeric(row.resolveSum) / resolveCount : 0,
+      avgDurationMs: numericNullable(row.latencyAvg) ?? 0,
+      latencyP50Ms: percentiles.p50 ?? 0,
+      latencyP95Ms: percentiles.p95 ?? 0,
+      latencyP99Ms: percentiles.p99 ?? 0,
+      latencySampleCount: sampled,
+      resolveSampleCount: resolveCount,
+      avgTokensPerSec: numeric(row.avgTokensPerSec),
+    },
+  };
+}

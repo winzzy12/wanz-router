@@ -1,0 +1,253 @@
+import { Loader2 } from "lucide-react";
+import { Suspense, useEffect, useState, type ReactNode } from "react";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { Toaster } from "sonner";
+import { DashboardShell } from "./apps/console/shell";
+import { CONSOLE_ROUTE_SPECS } from "./apps/console/route-manifest";
+import ErrorBoundary from "./components/ErrorBoundary";
+import { lazyWithRetry } from "./lib/lazy-retry";
+import { consoleRequest, fetchSessionUser, setSessionTransitionListener } from "./data/api";
+import { clearPersistedCache, queryClient } from "./data/query-client";
+import { queryKeys } from "./data/query-keys";
+import type { SessionUser } from "./data/contracts";
+
+/** Compact loading shell for lazy-route Suspense: never a blank viewport. */
+function RouteLoadingShell(): ReactNode {
+  return (
+    <div
+      role="status"
+      aria-label="Loading console"
+      className="min-h-dvh flex flex-col items-center justify-center gap-6 text-text-tertiary"
+    >
+      <Loader2 size={22} className="animate-spin" aria-hidden="true" />
+      <p className="text-caption">Loading console…</p>
+    </div>
+  );
+}
+
+// Route chunks are content-hashed: after a rebuild the previous page's chunk
+// URLs 404. lazyWithRetry reloads once to pick up the fresh index.html, then
+// surfaces to the ErrorBoundary instead of looping.
+const Login = lazyWithRetry(() => import("./features/session/LoginPage"), "login");
+const Setup = lazyWithRetry(() => import("./features/session/SetupPage"), "setup");
+const Banned = lazyWithRetry(() => import("./features/session/BannedPage"), "banned");
+const Overview = lazyWithRetry(() => import("./features/overview/OverviewPage"), "overview");
+const Usage = lazyWithRetry(() => import("./features/usage/UsagePage"), "usage");
+const ProviderDetail = lazyWithRetry(() => import("./features/provider-detail/ProviderDetailPage"), "provider-detail");
+const Providers = lazyWithRetry(() => import("./features/providers/ProvidersPage"), "providers");
+const Combos = lazyWithRetry(() => import("./features/routing/CombosPage"), "combos");
+const Quota = lazyWithRetry(() => import("./features/quota/QuotaPage"), "quota");
+const Proxy = lazyWithRetry(() => import("./features/proxy/ProxyPage"), "proxy");
+const Settings = lazyWithRetry(() => import("./features/settings/SettingsPage"), "settings");
+const CliTools = lazyWithRetry(() => import("./features/cli-tools/CliToolsPage"), "cli-tools");
+const CliToolDetail = lazyWithRetry(() => import("./features/cli-tools/CliToolDetailPage"), "cli-tool-detail");
+const ConsoleLogPage = lazyWithRetry(() => import("./features/logs/ConsoleLogPage"), "console-log");
+const Customization = lazyWithRetry(() => import("./features/customization/CustomizationPage"), "customization");
+const Studio = lazyWithRetry(() => import("./features/studio/StudioPage"), "studio");
+
+/**
+ * Forwards shell-wide session transitions into router navigation. A 401 means
+ * the session expired (go back to /login, preserving the return path); a 403
+ * means the client is locked out (go to /banned). Registered once per router
+ * lifetime; `api.ts` fans the signal out of every fresh failing response.
+ */
+function SessionTransitionBridge(): ReactNode {
+  const navigate = useNavigate();
+  const location = useLocation();
+  useEffect(() => {
+    setSessionTransitionListener((kind) => {
+      // The session is unusable: drop every cached tenant view so the next
+      // sign-in never renders the previous session's data. `clear()` empties
+      // memory only; the persisted snapshot is dropped with it, or a reload
+      // would rehydrate the previous tenant's catalog from disk.
+      queryClient.clear();
+      clearPersistedCache();
+      if (kind === "banned") {
+        navigate("/banned", { replace: true });
+        return;
+      }
+      navigate(`/login?returnTo=${encodeURIComponent(location.pathname)}`, { replace: true });
+    });
+    return () => setSessionTransitionListener(undefined);
+  }, [navigate, location.pathname]);
+  return null;
+}
+
+/** Wraps the top-level route tree so a lazy-route failure never blanks the viewport. */
+function RouteErrorBoundary(): ReactNode {
+  const location = useLocation();
+  return (
+    <ErrorBoundary resetKey={`${location.pathname}${location.search}`}>
+      <Suspense fallback={<RouteLoadingShell />}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/setup" element={<Setup />} />
+          <Route path="/banned" element={<Banned />} />
+          <Route path="/*" element={<ProtectedRoutes />} />
+        </Routes>
+      </Suspense>
+    </ErrorBoundary>
+  );
+}
+
+function ProtectedRoutes(): ReactNode {
+  const [state, setState] = useState<
+    | { kind: "loading" }
+    | { kind: "ready"; user: SessionUser }
+    | { kind: "unauthenticated"; needsSetup: boolean }
+    | { kind: "blocked" }
+  >({ kind: "loading" });
+  const location = useLocation();
+  const navigate = useNavigate();
+  // Captured once: the session is fetched on mount only, never refetched
+  // purely because the route changed.
+  const [initialPath] = useState(() => location.pathname);
+  useEffect(() => {
+    const controller = new AbortController();
+    // Prime the shared session cache so every downstream `useSessionUser()`
+    // consumer reads from the same fetched result — a duplicate GET on route
+    // mount would double-count login attempts against rate limits.
+    void queryClient
+      .fetchQuery({
+        queryKey: queryKeys.session.current,
+        queryFn: () => fetchSessionUser(),
+        staleTime: 60_000,
+      })
+      .then((user) => {
+        if (controller.signal.aborted) return;
+        if (user) {
+          queryClient.setQueryData(queryKeys.session.current, user);
+          setState({ kind: "ready", user });
+          if (user.isFirstBoot && initialPath !== "/setup")
+            navigate("/setup", { replace: true });
+          return;
+        }
+        // An unauthenticated result must never linger as fresh cache: a later
+        // sign-in landing on a protected route would otherwise resolve this
+        // stale `null` inside the 60s stale window and bounce straight back to
+        // /login in a redirect loop.
+        queryClient.removeQueries({ queryKey: queryKeys.session.current });
+        void consoleRequest<{ requires_setup: boolean }>("/auth/first-boot", {
+          signal: controller.signal,
+        })
+          .then((boot) => {
+            if (controller.signal.aborted) return;
+            setState({ kind: "unauthenticated", needsSetup: boot.requires_setup });
+          })
+          .catch(() => {
+            if (!controller.signal.aborted)
+              setState({ kind: "unauthenticated", needsSetup: false });
+          });
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "status" in error &&
+          error.status === 403
+        ) {
+          setState({ kind: "blocked" });
+        } else {
+          setState({ kind: "unauthenticated", needsSetup: false });
+        }
+      });
+    return () => controller.abort();
+  }, [initialPath, navigate]);
+  if (state.kind === "loading") return null;
+  if (state.kind === "blocked") return <Navigate to="/banned" replace />;
+  if (state.kind === "unauthenticated")
+    return (
+      <Navigate
+        to={
+          state.needsSetup ? "/setup" : `/login?returnTo=${encodeURIComponent(location.pathname)}`
+        }
+        replace
+      />
+    );
+  return (
+    <DashboardShell user={state.user}>
+      {/* No second boundary here. `RouteErrorBoundary` already wraps this whole
+          tree, and nesting one inside it caught the same throw twice — React
+          re-throws an error the nearest boundary did not commit, so the operator
+          saw the error surface rendered inside itself. */}
+      <Routes>
+        {CONSOLE_ROUTE_SPECS.map((route) => {
+          switch (route.key) {
+            case "overview":
+              return <Route key={route.key} path={route.path} element={<Overview />} />;
+            case "usage":
+              return <Route key={route.key} path={route.path} element={<Usage />} />;
+            case "providers":
+              return <Route key={route.key} path={route.path} element={<Providers />} />;
+            case "provider-detail":
+              return <Route key={route.key} path={route.path} element={<ProviderDetail />} />;
+            case "combos":
+              return <Route key={route.key} path={route.path} element={<Combos />} />;
+            case "quota":
+              return <Route key={route.key} path={route.path} element={<Quota />} />;
+            case "proxy":
+              return <Route key={route.key} path={route.path} element={<Proxy />} />;
+            case "console-log":
+              return <Route key={route.key} path={route.path} element={<ConsoleLogPage />} />;
+            case "customization":
+              return <Route key={route.key} path={route.path} element={<Customization />} />;
+            case "model-lab":
+              return <Route key={route.key} path={route.path} element={<Studio />} />;
+            case "cli-tools":
+              return <Route key={route.key} path={route.path} element={<CliTools />} />;
+            case "cli-tool-detail":
+              return <Route key={route.key} path={route.path} element={<CliToolDetail />} />;
+            case "settings":
+              return <Route key={route.key} path={route.path} element={<Settings />} />;
+          }
+        })}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </DashboardShell>
+  );
+}
+
+export function App(): ReactNode {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter basename="/console">
+        <SessionTransitionBridge />
+        <RouteErrorBoundary />
+        <Toaster
+          position="top-right"
+          offset={{ top: "6rem", right: "1rem" }}
+          mobileOffset={{ top: "6rem", left: "1rem", right: "1rem" }}
+          visibleToasts={2}
+          richColors
+          duration={5_000}
+          toastOptions={{
+            className: "toast-surface select-text",
+            descriptionClassName: "select-text",
+            classNames: {
+              title: "select-text",
+            },
+            style: {
+              background: "var(--glass-bg-2)",
+              border: "1px solid var(--glass-border-2)",
+              color: "var(--text-primary)",
+              fontSize: "12.5px",
+              userSelect: "text",
+            },
+            actionButtonStyle: {
+              background: "var(--accent)",
+              color: "var(--accent-foreground)",
+            },
+            cancelButtonStyle: {
+              background: "var(--surface-muted)",
+              color: "var(--text-primary)",
+            },
+          }}
+        />
+      </BrowserRouter>
+    </QueryClientProvider>
+  );
+}
+
+export default App;

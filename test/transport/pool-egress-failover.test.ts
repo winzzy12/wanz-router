@@ -1,0 +1,216 @@
+/**
+ * A refused egress must fail over to the next pool, not end the request.
+ *
+ * opencode is credential-less (`requiresAccount: false`), so its route plan
+ * holds exactly **one** candidate — and that candidate carries every eligible
+ * pool in `network_pool_ids`. Pool selection therefore happens *inside* one
+ * attempt, not by walking candidates.
+ *
+ * The attempt loop judged terminality as
+ * `!isRetryableFailure(error) || index === candidates.length - 1`. With one
+ * candidate, the second clause is true on the very first failure, so a 403
+ * that flagged the pool and asked for a different egress ended the request
+ * instead of retrying through the healthy pool sitting in the same candidate.
+ * The operator saw "all pools cooling" while an unflagged pool sat idle.
+ *
+ * The fix treats a pool-scoped failure as a new attempt against the same
+ * candidate: the pool is flagged first, the candidate is not marked failed, and
+ * the index does not advance. The budget still bounds the loop, so an all-pools
+ * -refused case terminates through selection with its own error.
+ */
+import { expect, test } from "bun:test";
+import { GatewayError } from "../../src/protocol/gateway-error";
+import { runAttemptLoop } from "../../src/transport/dispatch/attempt-loop";
+import { NetworkPoolSelector } from "../../src/network/pool/selector";
+import type { RouteCandidate } from "../../src/transport/routing/route-model";
+import { attemptCandidate, attemptLeaseSource, attemptState, prepareAttempt } from "../helpers/attempt-loop";
+
+/**
+ * One opencode candidate carrying both pools — the shape `route-catalog`
+ * builds for a credential-less provider.
+ */
+function opencodeCandidate(): RouteCandidate {
+  return {
+    ...attemptCandidate("opencode", "global"),
+    model_id: "big-pickle",
+    endpoint: "/zen/v1/chat/completions",
+    network_pool_ids: ["pool-a", "pool-b"],
+    network_pool_limits: { "pool-a": 10, "pool-b": 10 },
+    network_pool_weights: { "pool-a": 100, "pool-b": 100 },
+  };
+}
+
+/** The refusal the upstream sends for a flagged address: 403 FreeTierError. */
+function freeTierRefusal(): GatewayError {
+  return new GatewayError(
+    "authentication_failed",
+    403,
+    "FreeTierError: free tier can only be used from an allowed region",
+    { providerCode: "FreeTierError", rateLimitScope: "provider", raw: "FreeTierError" },
+    "upstream",
+  );
+}
+
+/**
+ * Drives the loop once. `onAttempt` receives the pool the selector chose, so a
+ * test can assert which egress the retry actually left by.
+ */
+async function runOnce(options: {
+  readonly pools: NetworkPoolSelector;
+  readonly onAttempt: () => string | GatewayError;
+  readonly maxAttempts?: number;
+}): Promise<{ readonly seen: readonly string[]; readonly error: unknown }> {
+  const previousAttempts = process.env["CARTETHYIA_ROUTE_MAX_ATTEMPTS"];
+  const previousBase = process.env["CARTETHYIA_FALLBACK_RETRY_BASE_MS"];
+  process.env["CARTETHYIA_ROUTE_MAX_ATTEMPTS"] = String(options.maxAttempts ?? 8);
+  process.env["CARTETHYIA_FALLBACK_RETRY_BASE_MS"] = "0";
+  const seen: string[] = [];
+  let error: unknown;
+  try {
+    const candidates = [opencodeCandidate()];
+    await runAttemptLoop<string, unknown>({
+      state: attemptState("req-pool-failover", Date.now() + 60_000),
+      deps: { db: {} as never, poolSelector: options.pools },
+      leaseSource: attemptLeaseSource(candidates, "big-pickle"),
+      candidates,
+      tenantId: "tenant-1",
+      strictPoolSelection: true,
+      prepare: prepareAttempt,
+      attempt: async (context: { readonly leases: { readonly networkPoolId?: string } }) => {
+        const poolId = context.leases.networkPoolId ?? "none";
+        seen.push(poolId);
+        const outcome = options.onAttempt();
+        if (outcome instanceof GatewayError) throw outcome;
+        return outcome;
+      },
+      exhaustedError: new GatewayError("accounts_unavailable", 503, "exhausted"),
+    }).catch((cause: unknown) => {
+      error = cause;
+    });
+    return { seen, error };
+  } finally {
+    if (previousAttempts === undefined) delete process.env["CARTETHYIA_ROUTE_MAX_ATTEMPTS"];
+    else process.env["CARTETHYIA_ROUTE_MAX_ATTEMPTS"] = previousAttempts;
+    if (previousBase === undefined) delete process.env["CARTETHYIA_FALLBACK_RETRY_BASE_MS"];
+    else process.env["CARTETHYIA_FALLBACK_RETRY_BASE_MS"] = previousBase;
+  }
+}
+
+test("a refused egress fails over to the next pool within one candidate", async () => {
+  const pools = new NetworkPoolSelector();
+  let attemptNumber = 0;
+  const { seen, error } = await runOnce({
+    pools,
+    onAttempt: () => {
+      // Refuse only the first egress; the second must serve.
+      attemptNumber += 1;
+      return attemptNumber === 1 ? freeTierRefusal() : "served";
+    },
+  });
+  expect(error).toBeUndefined();
+  expect(seen).toHaveLength(2);
+  expect(seen[0]).not.toBe(seen[1]);
+  // The refused pool is retired, and the other one is still usable.
+  expect(await pools.isProviderCooldown(seen[0]!, "opencode")).toMatchObject({
+    inCooldown: true,
+    blocked: true,
+  });
+  expect(await pools.isProviderCooldown(seen[1]!, "opencode")).toMatchObject({ inCooldown: false });
+});
+
+test("the refusal is never retried on the pool that caused it", async () => {
+  const pools = new NetworkPoolSelector();
+  const { seen } = await runOnce({
+    pools,
+    onAttempt: () => freeTierRefusal(),
+  });
+  // Each pool is tried at most once: the flag written by the first refusal
+  // takes it out of selection before the retry.
+  expect(new Set(seen).size).toBe(seen.length);
+});
+
+test("when every pool is refused the request ends with its own error, not a cooldown lie", async () => {
+  const pools = new NetworkPoolSelector();
+  const { seen, error } = await runOnce({
+    pools,
+    onAttempt: () => freeTierRefusal(),
+  });
+  expect(seen).toHaveLength(2);
+  expect(error).toBeInstanceOf(GatewayError);
+  const gateway = error as GatewayError;
+  expect(gateway.code).toBe("proxy_pool_blocked");
+  // Nothing clears a retired egress on a timer, so the message must not tell
+  // the operator to wait for one.
+  expect(gateway.message.toLowerCase()).not.toContain("cooling down");
+  expect(gateway.message).toContain("refuses");
+});
+
+test("a 403 from a provider that is not IP-scoped never retires a pool", async () => {
+  const pools = new NetworkPoolSelector();
+  const policyRejection = new GatewayError(
+    "policy_rejected",
+    403,
+    "content policy",
+    { providerCode: "11140" },
+    "upstream",
+  );
+  // `claude` is account-keyed, so a 403 is the request's problem, not the
+  // egress's. The guard is in the provider metadata, not in the caller.
+  const candidate = { ...opencodeCandidate(), provider_id: "claude" } as RouteCandidate;
+  const previousAttempts = process.env["CARTETHYIA_ROUTE_MAX_ATTEMPTS"];
+  const previousBase = process.env["CARTETHYIA_FALLBACK_RETRY_BASE_MS"];
+  process.env["CARTETHYIA_ROUTE_MAX_ATTEMPTS"] = "4";
+  process.env["CARTETHYIA_FALLBACK_RETRY_BASE_MS"] = "0";
+  try {
+    let thrown: unknown;
+    await runAttemptLoop<string, unknown>({
+      state: attemptState("req-pool-failover"),
+      deps: { db: {} as never, poolSelector: pools },
+      leaseSource: attemptLeaseSource([candidate], "big-pickle"),
+      candidates: [candidate],
+      tenantId: "tenant-1",
+      strictPoolSelection: true,
+      prepare: prepareAttempt,
+      attempt: async () => {
+        throw policyRejection;
+      },
+      exhaustedError: new GatewayError("accounts_unavailable", 503, "exhausted"),
+    }).catch((error: unknown) => { thrown = error; });
+    expect(thrown).toBe(policyRejection);
+  } finally {
+    if (previousAttempts === undefined) delete process.env["CARTETHYIA_ROUTE_MAX_ATTEMPTS"];
+    else process.env["CARTETHYIA_ROUTE_MAX_ATTEMPTS"] = previousAttempts;
+    if (previousBase === undefined) delete process.env["CARTETHYIA_FALLBACK_RETRY_BASE_MS"];
+    else process.env["CARTETHYIA_FALLBACK_RETRY_BASE_MS"] = previousBase;
+  }
+  // No pool may have been retired by a non-IP-scoped 403.
+  expect(await pools.isProviderCooldown("pool-a", "claude")).toMatchObject({ inCooldown: false });
+  expect(await pools.isProviderCooldown("pool-b", "claude")).toMatchObject({ inCooldown: false });
+});
+
+test("one IP-scoped provider's block does not retire the pool for another", async () => {
+  // The report was "1 blocked from opencode, blocking others!". Two facts make
+  // that impossible as stated, and both are pinned here: the block key is
+  // (poolId, providerId), so `opencode` cannot exclude a pool for a
+  // provider whose limits belong to the credential; and `opencode` is the only
+  // bundled provider that declares `ipScopedRateLimit`, so no second IP-scoped
+  // provider exists to inherit the marker — `kimi` routes by credential.
+  const pools = new NetworkPoolSelector();
+  await pools.flagProviderBlocked("pool-a", "opencode");
+
+  expect(await pools.isProviderCooldown("pool-a", "opencode")).toMatchObject({
+    inCooldown: true,
+    blocked: true,
+  });
+  // `kimi` is the other IP-scoped provider, on the same egress. The marker was
+  // written for opencode, so kimi must still see this pool as available.
+  expect(await pools.isProviderCooldown("pool-a", "kimi")).toMatchObject({ inCooldown: false });
+  // A credential-keyed provider is untouched as well.
+  expect(await pools.isProviderCooldown("pool-a", "anthropic")).toMatchObject({ inCooldown: false });
+
+  const acquired = await pools.tryAcquireAvailablePool(["pool-a"], "kimi");
+  expect(acquired?.poolId).toBe("pool-a");
+  acquired?.release();
+  // And the blocked provider still cannot have it.
+  expect(await pools.tryAcquireAvailablePool(["pool-a"], "opencode")).toBeUndefined();
+});

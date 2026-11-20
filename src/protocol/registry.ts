@@ -1,0 +1,253 @@
+import type { CanonicalEvent, CanonicalRequest, WireFamily } from "./canonical-model";
+import type { DialectPolicy } from "./translation/dialect/types";
+import type { ThinkingConfig } from "./translation/dialect/thinking-ladder";
+import { toolAliasesFor, type ToolNameAlias } from "./codecs";
+
+interface CodecContext {
+  readonly isOAuth?: boolean;
+  readonly sessionId?: string;
+  readonly supportsPromptCaching?: boolean;
+  readonly chatTokenLimitField?: "max_tokens" | "max_completion_tokens";
+  readonly maxOutputTokens?: number;
+  readonly promptCacheKey?: string;
+  readonly signal?: AbortSignal;
+  /**
+   * Per-tenant ceiling for one inline attachment, in bytes. Absent means the
+   * deployment default; only wire encoders that clamp images read it.
+   */
+  readonly maxBytesOverride?: number;
+  /**
+   * Resolved wire dialect (see `translation/dialect`). Absent = the codec's
+   * own default behavior (today's exact bytes).
+   */
+  readonly dialectPolicy?: DialectPolicy;
+  /**
+   * F-20: the upstream does not persist responses — the Responses codec
+   * strips `previous_response_id`/`conversation` instead of forwarding ids
+   * the upstream can only answer with 404.
+   */
+  readonly statelessResponses?: boolean;
+  /**
+   * Resolved thinking config (see `translation/dialect/thinking-ladder`).
+   * Absent = the codec's own default behavior (today's exact clamp/ladder).
+   */
+  readonly thinking?: ThinkingConfig;
+}
+
+/**
+ * One loaded codec for a single wire family.
+ *
+ * A union rather than one shape: the request encoders have different options
+ * per wire family, so the registry can call each with its actual contract
+ * without casting.
+ */
+type CodecModule =
+  | {
+      readonly family: "messages";
+      readonly encodeWireRequest: (
+        request: CanonicalRequest,
+        options?: {
+          readonly isOAuth?: boolean;
+          readonly maxBytesOverride?: number;
+          readonly dialectPolicy?: DialectPolicy;
+          readonly thinking?: ThinkingConfig;
+          readonly maxOutputTokens?: number;
+        },
+      ) => Record<string, unknown>;
+      readonly decodeWireResponse: (
+        json: Record<string, unknown>,
+        request: CanonicalRequest,
+        isOAuth?: boolean,
+      ) => readonly CanonicalEvent[];
+      readonly decodeWireStream: (
+        body: ReadableStream<Uint8Array>,
+        signal?: AbortSignal,
+        isOAuth?: boolean,
+        aliases?: ReadonlyArray<ToolNameAlias>,
+      ) => AsyncIterable<CanonicalEvent>;
+    }
+  | {
+      readonly family: "chat";
+      readonly encodeWireRequest: (
+        request: CanonicalRequest,
+        options?: {
+          readonly supportsPromptCaching?: boolean;
+          readonly tokenLimitField?: "max_tokens" | "max_completion_tokens";
+          readonly promptCacheKey?: string;
+          readonly dialectPolicy?: DialectPolicy;
+          readonly thinking?: ThinkingConfig;
+        },
+      ) => Record<string, unknown>;
+      readonly decodeWireResponse: (
+        json: Record<string, unknown>,
+        request: CanonicalRequest,
+      ) => readonly CanonicalEvent[];
+      readonly decodeWireStream: (
+        body: ReadableStream<Uint8Array>,
+        request: CanonicalRequest,
+        signal?: AbortSignal,
+        options?: { readonly dialectPolicy?: DialectPolicy },
+      ) => AsyncIterable<CanonicalEvent>;
+    }
+  | {
+      readonly family: "responses";
+      readonly encodeWireRequest: (
+        request: CanonicalRequest,
+        options?: {
+          readonly supportsPromptCaching?: boolean;
+          readonly promptCacheKey?: string;
+          readonly dialectPolicy?: DialectPolicy;
+          readonly thinking?: ThinkingConfig;
+          readonly maxOutputTokens?: number;
+          readonly statelessResponses?: boolean;
+        },
+      ) => Record<string, unknown>;
+      readonly decodeWireResponse: (
+        json: Record<string, unknown>,
+        request: CanonicalRequest,
+      ) => readonly CanonicalEvent[];
+      readonly decodeWireStream: (
+        body: ReadableStream<Uint8Array>,
+        request: CanonicalRequest,
+        signal?: AbortSignal,
+      ) => AsyncIterable<CanonicalEvent>;
+    }
+
+/**
+ * Loads the codec for one wire family, caching the module after the first load.
+ *
+ * Dynamic import is required rather than a style choice: the specifier is
+ * selected by the runtime `wireFamily` value, and a static import of all three
+ * codecs is exactly the ~50 MiB of resident memory this indirection removes —
+ * each codec is ~10 MiB of module graph and a gateway instance only ever serves
+ * one family. The cost is paid once, on the first request for that family,
+ * because wire encoding happens before the upstream request is issued. No
+ * boot-time preload exists: no family is knowable at boot.
+ */
+const codecCache = new Map<WireFamily, Promise<CodecModule>>();
+
+/** Resolves (and memoizes in `codecCache`) the codec for one wire family. */
+async function loadCodec(wireFamily: WireFamily): Promise<CodecModule> {
+  const cached = codecCache.get(wireFamily);
+  if (cached !== undefined) return cached;
+  const promise = (async (): Promise<CodecModule> => {
+    // dynamic-import: codec picked by wire family at request time; static
+    // imports here would couple every request path to every codec module.
+    switch (wireFamily) {
+      case "chat":
+        return (await import("./request/chat")).chatCodecModule;
+      case "responses":
+        return (await import("./request/responses")).responsesCodecModule;
+      case "messages":
+        return (await import("./request/messages")).messagesCodecModule;
+      default:
+        throw new Error(`unsupported wire family: ${wireFamily}`);
+    }
+  })();
+  codecCache.set(wireFamily, promise);
+  return promise;
+}
+
+export async function encodeWireRequest(
+  wireFamily: WireFamily,
+  request: CanonicalRequest,
+  context?: CodecContext,
+): Promise<Record<string, unknown>> {
+  const codec = await loadCodec(wireFamily);
+  if (codec.family === "messages") {
+    return codec.encodeWireRequest(request, {
+      ...(context?.isOAuth === undefined ? {} : { isOAuth: context.isOAuth }),
+      ...(context?.maxBytesOverride === undefined
+        ? {}
+        : { maxBytesOverride: context.maxBytesOverride }),
+      ...(context?.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: context.maxOutputTokens }),
+      ...(context?.dialectPolicy === undefined ? {} : { dialectPolicy: context.dialectPolicy }),
+      ...(context?.thinking === undefined ? {} : { thinking: context.thinking }),
+    });
+  }
+  if (codec.family === "chat") {
+    return codec.encodeWireRequest(request, {
+      ...(context?.supportsPromptCaching === undefined
+        ? {}
+        : { supportsPromptCaching: context.supportsPromptCaching }),
+      ...(context?.chatTokenLimitField === undefined
+        ? {}
+        : { tokenLimitField: context.chatTokenLimitField }),
+      ...(context?.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: context.maxOutputTokens }),
+      ...(context?.promptCacheKey === undefined
+        ? {}
+        : { promptCacheKey: context.promptCacheKey }),
+      ...(context?.dialectPolicy === undefined ? {} : { dialectPolicy: context.dialectPolicy }),
+      ...(context?.thinking === undefined ? {} : { thinking: context.thinking }),
+    });
+  }
+  return codec.encodeWireRequest(request, {
+    ...(context?.supportsPromptCaching === undefined
+      ? {}
+      : { supportsPromptCaching: context.supportsPromptCaching }),
+    ...(context?.promptCacheKey === undefined
+      ? {}
+      : { promptCacheKey: context.promptCacheKey }),
+    ...(context?.maxOutputTokens === undefined
+      ? {}
+      : { maxOutputTokens: context.maxOutputTokens }),
+    ...(context?.dialectPolicy === undefined ? {} : { dialectPolicy: context.dialectPolicy }),
+    ...(context?.thinking === undefined ? {} : { thinking: context.thinking }),
+    ...(context?.statelessResponses === undefined
+      ? {}
+      : { statelessResponses: context.statelessResponses }),
+  });
+}
+
+export async function decodeWireResponse(
+  wireFamily: WireFamily,
+  json: Record<string, unknown>,
+  request: CanonicalRequest,
+  context?: CodecContext,
+): Promise<readonly CanonicalEvent[]> {
+  const codec = await loadCodec(wireFamily);
+  if (codec.family === "messages") {
+    return codec.decodeWireResponse(json, request, context?.isOAuth ?? false);
+  }
+  return codec.decodeWireResponse(json, request);
+}
+
+export function decodeWireStream(
+  wireFamily: WireFamily,
+  body: ReadableStream<Uint8Array>,
+  request: CanonicalRequest,
+  context?: CodecContext,
+): AsyncIterable<CanonicalEvent> {
+  // A lazy async generator: the module is imported on first iteration, which
+  // happens before the first byte is read, so no import cost lands inside the
+  // streaming loop itself.
+  async function* decode(): AsyncIterable<CanonicalEvent> {
+    const codec = await loadCodec(wireFamily);
+    if (codec.family === "messages") {
+      // The Anthropic decoder does not take the canonical request: it rebuilds
+      // its state from the SSE frames alone. Tool-name aliases are the
+      // exception — they are recorded on the request object at encode time,
+      // so the registry reads them back here rather than threading a new
+      // parameter through every caller.
+      yield* codec.decodeWireStream(
+        body,
+        context?.signal,
+        context?.isOAuth ?? false,
+        toolAliasesFor(request),
+      );
+      return;
+    }
+    if (codec.family === "chat") {
+      yield* codec.decodeWireStream(body, request, context?.signal, {
+        ...(context?.dialectPolicy === undefined ? {} : { dialectPolicy: context.dialectPolicy }),
+      });
+      return;
+    }
+    yield* codec.decodeWireStream(body, request, context?.signal);
+  }
+  return decode();
+}

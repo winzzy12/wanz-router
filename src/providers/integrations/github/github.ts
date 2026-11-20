@@ -1,0 +1,807 @@
+/**
+ * GitHub Copilot adapter.
+ *
+ * Copilot is an OpenAI-compatible chat surface, but not a fixed one: the API
+ * host is per-account and is read out of the Copilot token's `proxy-ep` claim,
+ * so an Individual account and an enterprise account post to different hosts.
+ * That is why this is a bespoke adapter rather than a declarative spec — the
+ * `base_url` a spec carries is fixed at registration, and the routing layer
+ * resolves one base URL per provider, not per account.
+ *
+ * The credential is a `{access, apiHost}` envelope for the same reason the
+ * host is not a constant: the value stored at login is the only place the
+ * account's host is recorded.
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { defineModel } from "../../provider-model-definition";
+import type { ModelDefinition } from "../../provider-model-definition";
+import type { ProviderAdapter, ProviderDispatchContext, ProviderDispatchTarget } from "../../provider-contracts";
+import { GatewayError } from "../../../protocol/gateway-error";
+import { isRecord } from "../../../protocol/codecs";
+import {
+  mapUpstreamHttpError,
+} from "../../../protocol/upstream-errors";
+import { allParts, type CanonicalEvent, type CanonicalRequest, type ContentPart } from "../../../protocol/canonical-model";
+import { OpenAICompatibleAdapter, withBearerAuthentication } from "../../adapters/compatible-adapter";
+import { postUpstreamJson } from "../../../protocol/upstream/post-json";
+import { providerBaseUrl } from "../../provider-metadata";
+import { resolveRedisClient } from "../../../persistence/redis";
+import { TtlCache } from "../../../persistence/ttl-cache";
+import { applyParamQuirks } from "../../../protocol/translation/quirks";
+import { resolveInboundSessionId } from "../../operations/session-resolution";
+import {
+  GITHUB_REQUEST_HEADERS,
+  githubCopilotClientIds,
+  parseGithubCredential,
+  type GithubCredential,
+} from "./github-oauth";
+import { resolveGithubCopilotMode } from "../../../config/providers";
+
+export const GITHUB_PROVIDER_ID = "github" as const;
+
+/** Chat surface. The static fallback rows are all chat. */
+export const GITHUB_ENDPOINT_PATH = "/chat/completions" as const;
+
+/**
+ * Responses surface. Copilot serves some SKUs only on `/responses`, so a
+ * discovered row declares this path and the shared pipeline routes the request
+ * here rather than failing on the chat endpoint.
+ */
+export const GITHUB_RESPONSES_ENDPOINT_PATH = "/responses" as const;
+
+/**
+ * Anthropic Messages surface. Copilot serves the premium Claude family
+ * (`claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*`)
+ * on the native `/v1/messages` wire, and some SKUs are messages-only. The
+ * adapter's shared pipeline already speaks the messages codec; this constant
+ * lets discovery route those rows here instead of dropping them.
+ */
+export const GITHUB_MESSAGES_ENDPOINT_PATH = "/v1/messages" as const;
+
+
+
+// F-32: the Copilot fallback effort ceiling (`max`/`xhigh` answered at
+// `high` for a model that declares no ladder of its own) moved to a ladder
+// rule (`provider: /^github$/` in thinking-ladder.ts), so the generic clamp
+// owns it and this adapter carries no prePayload mutation for it.
+
+
+/** Supported virtual Copilot Auto catalog ids and their router tiers. */
+export const GITHUB_AUTO_MODEL_TIERS: ReadonlyMap<string, "efficiency" | "balance" | "intelligence"> = new Map([
+  // The legacy virtual `auto` id: balance-tier decisions are picked
+  // dynamically by the upstream either way, so requesting `auto` enters the
+  // same /auto flow pinned to the balance tier.
+  ["auto", "balance"],
+  ["gpt-6-luna", "efficiency"],
+  // Intelligence-tier alias: a request for the model the upstream picks on
+  // the intelligence tier enters the same /auto flow pinned to that tier
+  // (verified live 2026-11-18: intelligence → mai-code-2-flash).
+  ["mai-code-2-flash", "intelligence"],
+]);
+
+/** Copilot model ids excluded from both the fallback and discovered catalogs. */
+export const GITHUB_EXCLUDED_MODEL_IDS: ReadonlySet<string> = new Set([
+  "copilot-search-c",
+  "exec-agent-a",
+  "exec-agent-b",
+  "exec-agent-c",
+  "gpt-5.4-mini-free-auto",
+  "gpt-5.6-luna",
+  "gpt-5.6-luna-free-auto",
+  "gpt-6-luna-low",
+  "gpt-6-luna-medium",
+  "gpt-6-luna-high",
+  "kimi-k3",
+]);
+
+/**
+ * Shared route-map window. Discovery is per account and infrequent, so a short
+ * shared entry lets a peer instance route a credential without re-running
+ * discovery. Keyed by the credential hash already computed below, so no
+ * credential material reaches the cache value.
+ */
+const GITHUB_ROUTE_TTL_SECONDS = 300;
+const GITHUB_ROUTE_KEY_PREFIX = "github:routes:v1:";
+/** Hard ceiling on locally remembered route maps, keyed by credential hash. */
+const GITHUB_ROUTE_MAX_CREDENTIALS = 256;
+
+/**
+ * Per-credential model→route maps, bounded (TTL + entry cap) like the
+ * auto-decision cache below: credential hashes churn as accounts are
+ * re-created, and a plain module-level Map would grow for the life of the
+ * process. The TTL matches the shared window — an expired local entry falls
+ * through to the Redis copy and is re-cached.
+ */
+const modelRoutesByCredential = new TtlCache<ReadonlyMap<string, GithubModelRoute>>({
+  ttlMs: GITHUB_ROUTE_TTL_SECONDS * 1000,
+  maxEntries: GITHUB_ROUTE_MAX_CREDENTIALS,
+});
+
+function serializeRouteMap(routes: ReadonlyMap<string, GithubModelRoute>): string {
+  return JSON.stringify([...routes]);
+}
+
+function parseRouteMap(raw: string): Map<string, GithubModelRoute> | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return undefined;
+    const map = new Map<string, GithubModelRoute>();
+    for (const entry of parsed) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [modelId, route] = entry as [unknown, unknown];
+      if (typeof modelId !== "string" || route === null || typeof route !== "object") continue;
+      const wireFamily = (route as { wireFamily?: unknown }).wireFamily;
+      const endpointPath = (route as { endpointPath?: unknown }).endpointPath;
+      if (
+        (wireFamily === "chat" || wireFamily === "responses" || wireFamily === "messages") &&
+        typeof endpointPath === "string"
+      ) {
+        map.set(modelId, { wireFamily, endpointPath });
+      }
+    }
+    return map.size > 0 ? map : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readSharedModelRoutes(key: string): Promise<Map<string, GithubModelRoute> | undefined> {
+  const redis = resolveRedisClient();
+  if (!redis) return undefined;
+  try {
+    const hit = await redis.get(`${GITHUB_ROUTE_KEY_PREFIX}${key}`);
+    return hit === null ? undefined : parseRouteMap(hit);
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeSharedModelRoutes(
+  key: string,
+  routes: ReadonlyMap<string, GithubModelRoute>,
+): Promise<void> {
+  const redis = resolveRedisClient();
+  if (!redis) return;
+  try {
+    await redis.set(
+      `${GITHUB_ROUTE_KEY_PREFIX}${key}`,
+      serializeRouteMap(routes),
+      "EX",
+      GITHUB_ROUTE_TTL_SECONDS,
+    );
+  } catch {
+    // Shared visibility only; the local map stays authoritative.
+  }
+}
+
+export interface GithubModelRoute {
+  readonly wireFamily: "chat" | "responses" | "messages";
+  readonly endpointPath: string;
+}
+const GITHUB_AUTO_SESSION_CACHE_MAX_ENTRIES = 50;
+const GITHUB_AUTO_SESSION_EXPIRY_SKEW_MS = 5 * 60 * 1_000;
+
+function githubCredentialKey(value: string): string | undefined {
+  try {
+    const credential = parseGithubCredential(value);
+    return createHash("sha256")
+      .update(`${credential.apiHost}:${credential.github ?? credential.access}`)
+      .digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+/** Replaces this account's discovered model-to-endpoint routing map. */
+export function recordGithubModelRoutes(
+  credential: string,
+  models: readonly ModelDefinition[],
+): void {
+  const key = githubCredentialKey(credential);
+  if (key === undefined) return;
+  const routes = models
+    .filter(
+      (model): model is ModelDefinition & { readonly wireFamily: "chat" | "responses" | "messages" } =>
+        model.wireFamily === "chat" || model.wireFamily === "responses" || model.wireFamily === "messages",
+    )
+    .map((model) => [
+      model.modelId.toLowerCase(),
+      { wireFamily: model.wireFamily, endpointPath: model.endpointPath },
+    ] as const);
+  const routeMap = new Map(routes);
+  modelRoutesByCredential.set(key, routeMap);
+  // Publish for peer instances without blocking discovery on the write.
+  void writeSharedModelRoutes(key, routeMap);
+}
+
+/** Looks up an inference surface reported by this account's model directory. */
+export async function githubModelRoute(
+  modelId: string,
+  credential: string,
+): Promise<GithubModelRoute | undefined> {
+  const key = githubCredentialKey(credential);
+  if (key === undefined) return undefined;
+  const local = modelRoutesByCredential.get(key);
+  if (local !== undefined) return local.get(modelId.toLowerCase());
+  const shared = await readSharedModelRoutes(key);
+  if (shared === undefined) return undefined;
+  modelRoutesByCredential.set(key, shared);
+  return shared.get(modelId.toLowerCase());
+}
+
+function isAgentInitiated(request: CanonicalRequest): boolean {
+  const lastMessage = request.messages.at(-1);
+  if (!lastMessage) return false;
+  if (lastMessage.role === "assistant" || lastMessage.role === "tool") return true;
+  return lastMessage.content.length > 0 &&
+    lastMessage.content.every((part) => part.kind === "toolResult");
+}
+
+function containsImage(part: ContentPart): boolean {
+  if (part.kind === "image") return true;
+  return part.kind === "toolResult" &&
+    Array.isArray(part.content) &&
+    part.content.some(containsImage);
+}
+
+function autoPromptPart(part: ContentPart): string {
+  switch (part.kind) {
+    case "text":
+    case "refusal":
+      return part.text;
+    case "toolCall":
+      return `Tool call ${part.name}: ${JSON.stringify(part.arguments)}`;
+    case "toolResult":
+      return typeof part.content === "string"
+        ? part.content
+        : part.content.map(autoPromptPart).filter(Boolean).join("\n");
+    case "image":
+      return "[image attached]";
+    case "file":
+      return `[file${part.filename ? `: ${part.filename}` : ""}]`;
+    case "document":
+      return `[document${part.title ? `: ${part.title}` : ""}]`;
+    case "audio":
+      return "[audio attached]";
+    case "reasoning":
+      return part.summary ?? "";
+    case "extension":
+      return "";
+    default: {
+      const exhaustive: never = part;
+      return exhaustive;
+    }
+  }
+}
+
+interface GithubAutoPrompt {
+  readonly prompt: string;
+  readonly hasImage: boolean;
+}
+
+function autoPrompt(request: CanonicalRequest): GithubAutoPrompt {
+  for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+    const message = request.messages[index];
+    if (message?.role !== "user") continue;
+    const parts = message.content.filter(
+      (part) => part.kind !== "toolCall" && part.kind !== "toolResult" &&
+        part.kind !== "reasoning" && part.kind !== "extension",
+    );
+    const prompt = parts.map(autoPromptPart).filter(Boolean).join("\n");
+    if (prompt.length === 0) continue;
+    return {
+      prompt,
+      hasImage: parts.some(containsImage),
+    };
+  }
+  return { prompt: "", hasImage: false };
+}
+
+interface GithubAutoDecision {
+  readonly modelId: string;
+  readonly sessionToken: string;
+  readonly expiresAt: number;
+  readonly hasImage: boolean;
+  readonly route?: GithubModelRoute;
+}
+
+function routeFromAutoModel(value: unknown): GithubModelRoute | undefined {
+  if (!isRecord(value) || !Array.isArray(value["supported_endpoints"])) return undefined;
+  const endpoints = new Set(
+    value["supported_endpoints"]
+      .filter((endpoint): endpoint is string => typeof endpoint === "string")
+      .map((endpoint) => endpoint.replace(/^\/v1(?=\/)/, "")),
+  );
+  // Live-verified 2026-11-18: every Auto tier serves only on `/responses`.
+  // `gpt-6-luna` (efficiency) advertises `/responses` alone, and
+  // `mai-code-2-flash` (balance/intelligence) advertises `/chat/completions`
+  // too but still answers 400 `no_available_model_endpoints` there. The
+  // upstream's advertised chat surface is a lie for these selected models, so
+  // responses wins whenever it is advertised; chat is only a fallback when
+  // responses is absent.
+  if (endpoints.has("/responses")) {
+    return { wireFamily: "responses", endpointPath: GITHUB_RESPONSES_ENDPOINT_PATH };
+  }
+  if (endpoints.has("/chat/completions")) {
+    return { wireFamily: "chat", endpointPath: GITHUB_ENDPOINT_PATH };
+  }
+  if (endpoints.has("/messages")) {
+    return { wireFamily: "messages", endpointPath: GITHUB_MESSAGES_ENDPOINT_PATH };
+  }
+  return undefined;
+}
+
+interface CopilotModelOptions {
+  readonly vision?: boolean;
+  readonly reasoning?: boolean;
+}
+
+function copilotModel(
+  modelId: string,
+  contextLimit: number,
+  outputLimit: number,
+  options: CopilotModelOptions = {},
+): ModelDefinition {
+  return defineModel({
+    id: modelId,
+    providerId: GITHUB_PROVIDER_ID,
+    wireFamily: "chat",
+    endpoint: GITHUB_ENDPOINT_PATH,
+    ctx: contextLimit,
+    out: outputLimit,
+    vision: options.vision ?? false,
+    reasoning: options.reasoning ?? false,
+    toolCall: true,
+  });
+}
+
+export const GITHUB_AUTO_MODELS: readonly ModelDefinition[] = [
+  ...[...GITHUB_AUTO_MODEL_TIERS.keys()].map((modelId) =>
+    copilotModel(modelId, 1_000_000, 64_192, { vision: true, reasoning: true }),
+  ),
+];
+
+/**
+ * Static fallback catalog.
+ *
+ * The authoritative list is the account's own `/models` response, which reports
+ * exactly which SKUs the subscription may use — so this list is the offline
+ * floor, not the truth. It includes models verified reachable on the
+ * `vscode-chat` integration. Models that failed reachability checks or are
+ * still being tested are deliberately excluded. Limits come from the models.dev
+ * base catalog where it knows the id (the ids here are the upstream vendors'
+ * own).
+ */
+export const GITHUB_MODELS: readonly ModelDefinition[] = [
+  ...GITHUB_AUTO_MODELS,
+  copilotModel("gpt-4.1", 128_000, 32_768, { vision: true }),
+  copilotModel("gpt-4o", 128_000, 16_384, { vision: true }),
+  copilotModel("gpt-4o-mini", 128_000, 16_384, { vision: true }),
+  copilotModel("gpt-3.5-turbo-0613", 16_385, 4_096),
+  // Fireworks-hosted agent SKUs. `billing.restricted_to` on the account's own
+  // catalog includes `free`, so they are usable without a paid plan.
+  copilotModel("copilot-search-a", 260_000, 16_000),
+  copilotModel("copilot-search-b", 260_000, 16_000),
+];
+
+/**
+ * Adapter that derives its host and headers from the stored credential.
+ *
+ * `prepareHeaders` and the URL are both corrected rather than rebuilt: payload
+ * translation, transport, SSE decoding, and error mapping stay with the shared
+ * pipeline, so only the two Copilot-specific facts (the host and the client
+ * identity) are supplied here.
+ */
+function assertGithubProfileMatchesMode(credential: GithubCredential): void {
+  const mode = resolveGithubCopilotMode();
+  if (credential.profile !== mode) {
+    throw new GatewayError(
+      "authentication_failed",
+      401,
+      `GitHub Copilot account is bound to ${credential.profile}; reconnect it after selecting ${mode}.`,
+      { credentialEvidence: true, accountScope: true },
+    );
+  }
+}
+
+class GithubAdapter extends OpenAICompatibleAdapter {
+  readonly #fallbackBaseUrl: string;
+  /**
+   * Transport seam, held here because this adapter issues its own request: the
+   * shared config's `fetch` is private, and ignoring it would send a test's
+   * injected transport to the real network.
+   */
+  readonly #fetch: typeof fetch | undefined;
+  readonly #autoSessionTokens = new WeakMap<CanonicalRequest, string>();
+  readonly #autoDecisions = new Map<string, GithubAutoDecision>();
+
+  constructor(fallbackBaseUrl: string, fetchImpl?: typeof fetch) {
+    super(
+      withBearerAuthentication({
+        provider_id: GITHUB_PROVIDER_ID,
+        base_url: fallbackBaseUrl,
+        endpoint_paths_by_wire_family: {
+          chat: GITHUB_ENDPOINT_PATH,
+          responses: GITHUB_RESPONSES_ENDPOINT_PATH,
+        },
+        ...(fetchImpl ? { fetchImpl } : {}),
+      }),
+    );
+    this.#fallbackBaseUrl = fallbackBaseUrl;
+    this.#fetch = fetchImpl;
+  }
+
+  override async *dispatch(
+    request: CanonicalRequest,
+    candidate: ProviderDispatchTarget,
+    context: ProviderDispatchContext,
+  ): AsyncIterable<CanonicalEvent> {
+    const tier = GITHUB_AUTO_MODEL_TIERS.get(candidate.model_id.toLowerCase());
+    if (tier === undefined) {
+      yield* super.dispatch(request, candidate, context);
+      return;
+    }
+
+    const secret = context.credential.secret;
+    if (secret === undefined || secret.length === 0) {
+      throw new GatewayError("authentication_failed", 401, "GitHub Copilot credential is missing (request {requestId}). Wrong key, right door — check the credential 🔑");
+    }
+    const credential = new TextDecoder().decode(secret);
+    const parsedCredential = parseGithubCredential(credential);
+    assertGithubProfileMatchesMode(parsedCredential);
+    const autoInput = autoPrompt(request);
+    const sessionId = resolveInboundSessionId(context, request);
+    const profile = resolveGithubCopilotMode();
+    const cacheKey = sessionId === undefined || sessionId.startsWith("aff_")
+      ? undefined
+      : this.#autoDecisionCacheKey(credential, sessionId, tier, profile);
+    let autoDecision = cacheKey === undefined
+      ? undefined
+      : this.#getCachedAutoDecision(cacheKey, autoInput.hasImage);
+    if (autoDecision === undefined) {
+      if (autoInput.prompt.length === 0) {
+        throw new GatewayError("invalid_request", 400, "Copilot Auto requires a text prompt (request {requestId}). Check the shape of what you sent — then resend 🪞");
+      }
+      autoDecision = await this.#selectAutoModel(
+        autoInput.prompt,
+        tier,
+        autoInput.hasImage,
+        request,
+        candidate,
+        context,
+      );
+      if (cacheKey !== undefined) this.#cacheAutoDecision(cacheKey, autoDecision);
+    }
+    const selectedModelId = autoDecision.modelId;
+    let route = autoDecision.route ?? await githubModelRoute(selectedModelId, credential);
+    if (route === undefined) {
+      // dynamic-import: discovery module is only loaded when the first
+      // request routes to a model id not in the bundled roster; off the hot
+      // path for most deployments.
+      const { discoverGithubModels } = await import("./github-discovery");
+      const outboundFetch = context.outbound_fetch;
+      const fetcher = outboundFetch === undefined
+        ? this.#fetch ?? globalThis.fetch
+        : Object.assign(
+            (input: RequestInfo | URL, init?: RequestInit) => outboundFetch(input, init),
+            { preconnect: globalThis.fetch.preconnect.bind(globalThis.fetch) },
+          );
+      await discoverGithubModels({
+        credential,
+        fetcher,
+        signal: context.abort_signal,
+      });
+      if (context.abort_signal.aborted) throw context.abort_signal.reason;
+      route = await githubModelRoute(selectedModelId, credential);
+    }
+    if (route === undefined) {
+      throw new GatewayError(
+        "upstream_unprocessable",
+        502,
+        "Copilot Auto selected a model without a discovered inference endpoint (request {requestId}). The upstream came back empty-handed — retry 🌙",
+        { selected_model: selectedModelId },
+        "upstream",
+      );
+    }
+
+    const routedRequest = applyParamQuirks(
+      { ...request, model: selectedModelId },
+      candidate.provider_id,
+      candidate.wire_family,
+    );
+    this.#autoSessionTokens.set(routedRequest, autoDecision.sessionToken);
+    yield* super.dispatch(
+      routedRequest,
+      {
+        ...candidate,
+        model_id: selectedModelId,
+        wire_family: route.wireFamily,
+        endpoint_path: route.endpointPath,
+      },
+      context,
+    );
+  }
+
+  /**
+   * Minimal OpenCode-style Copilot headers using the long-lived GitHub OAuth
+   * token directly (no minted Copilot token, no VS Code identity). This is
+   * the shape the official OpenCode plugin sends; proven live (2026-11-03):
+   *
+   * - POST /auto with these headers + the raw GitHub token -> 200, returns the
+   *   session token and selects gpt-6-luna;
+   * - POST /responses with `Copilot-Session-Token` + GitHub token -> 200 stream.
+   */
+  async #opencodeStyleHeaders(
+    context: ProviderDispatchContext,
+    request: CanonicalRequest,
+    credential: GithubCredential,
+  ): Promise<Record<string, string>> {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "user-agent": "opencode/0.1.0",
+      "openai-intent": "conversation-edits",
+      "x-github-api-version": "2026-08-01",
+      "x-interaction-type": "conversation-agent",
+      "x-interaction-id": randomUUID(),
+      "x-initiator": isAgentInitiated(request) ? "agent" : "user",
+      "x-request-id": context.request_id ?? randomUUID(),
+    };
+    if (credential.github !== undefined && credential.github.length > 0) {
+      headers.authorization = `Bearer ${credential.github}`;
+    }
+    return headers;
+  }
+
+  async #selectAutoModel(
+    prompt: string,
+    tier: "efficiency" | "balance" | "intelligence",
+    hasImage: boolean,
+    request: CanonicalRequest,
+    candidate: ProviderDispatchTarget,
+    context: ProviderDispatchContext,
+  ): Promise<GithubAutoDecision> {
+    const credential = context.credential.secret === undefined
+      ? undefined
+      : parseGithubCredential(new TextDecoder().decode(context.credential.secret));
+    if (credential === undefined) {
+      throw new GatewayError("authentication_failed", 401, "GitHub Copilot credential is missing (request {requestId}). Wrong key, right door — check the credential 🔑");
+    }
+    assertGithubProfileMatchesMode(credential);
+    // /auto remains Cartethyia's Auto selection feature in both wire profiles;
+    // only prepareHeaders chooses the OAuth app's matching identity.
+    const headers = await this.prepareHeaders(context, request, candidate);
+    const payload: Record<string, unknown> = { prompt, tier };
+    if (hasImage) payload.has_image = true;
+    const outboundFetch = context.outbound_fetch ?? this.#fetch ?? globalThis.fetch;
+    const upstream = await postUpstreamJson(
+      `https://${credential.apiHost}/auto`,
+      headers,
+      payload,
+      context,
+      outboundFetch,
+    );
+    let responsePayload: unknown;
+    try {
+      if (!upstream.res.ok) {
+        await mapUpstreamHttpError(upstream.res, GITHUB_PROVIDER_ID);
+      }
+      responsePayload = await upstream.res.json();
+    } catch (error) {
+      if (error instanceof GatewayError) throw error;
+      if (context.abort_signal.aborted || upstream.signal.aborted) throw error;
+      throw new GatewayError(
+        "upstream_unprocessable",
+        502,
+        "Copilot Auto returned an invalid routing response (request {requestId}). The upstream came back empty-handed — retry 🌙",
+        {},
+        "upstream",
+      );
+    } finally {
+      upstream.release();
+    }
+    if (
+      typeof responsePayload !== "object" ||
+      responsePayload === null ||
+      !("selected_model" in responsePayload) ||
+      typeof responsePayload.selected_model !== "object" ||
+      responsePayload.selected_model === null ||
+      !("id" in responsePayload.selected_model) ||
+      typeof responsePayload.selected_model.id !== "string" ||
+      responsePayload.selected_model.id.trim().length === 0 ||
+      !("session_token" in responsePayload) ||
+      typeof responsePayload.session_token !== "string" ||
+      responsePayload.session_token.trim().length === 0
+    ) {
+      throw new GatewayError(
+        "upstream_unprocessable",
+        502,
+        "Copilot Auto did not return a selected model (request {requestId}). The upstream came back empty-handed — retry 🌙",
+        {},
+        "upstream",
+      );
+    }
+    const expiresAt =
+      "expires_at" in responsePayload &&
+      typeof responsePayload.expires_at === "number" &&
+      Number.isFinite(responsePayload.expires_at)
+        ? responsePayload.expires_at
+        : 0;
+    const route = routeFromAutoModel(responsePayload.selected_model);
+    return {
+      modelId: responsePayload.selected_model.id.trim(),
+      sessionToken: responsePayload.session_token.trim(),
+      expiresAt,
+      hasImage,
+      ...(route === undefined ? {} : { route }),
+    };
+  }
+
+  #autoDecisionCacheKey(
+    credentialValue: string,
+    sessionId: string,
+    tier: "efficiency" | "balance" | "intelligence",
+    profile: ReturnType<typeof resolveGithubCopilotMode>,
+  ): string {
+    const credential = parseGithubCredential(credentialValue);
+    const account = createHash("sha256")
+      .update(`${credential.apiHost}:${credential.access}`)
+      .digest("hex");
+    return `${account}:${profile}:${tier}:${sessionId}`;
+  }
+
+  #getCachedAutoDecision(
+    cacheKey: string,
+    hasImage: boolean,
+  ): GithubAutoDecision | undefined {
+    const decision = this.#autoDecisions.get(cacheKey);
+    if (decision === undefined) return undefined;
+    if (
+      decision.expiresAt * 1_000 - Date.now() < GITHUB_AUTO_SESSION_EXPIRY_SKEW_MS ||
+      (hasImage && !decision.hasImage)
+    ) {
+      this.#autoDecisions.delete(cacheKey);
+      return undefined;
+    }
+    this.#autoDecisions.delete(cacheKey);
+    this.#autoDecisions.set(cacheKey, decision);
+    return decision;
+  }
+
+  #cacheAutoDecision(cacheKey: string, decision: GithubAutoDecision): void {
+    if (
+      decision.expiresAt * 1_000 - Date.now() < GITHUB_AUTO_SESSION_EXPIRY_SKEW_MS
+    ) return;
+    this.#autoDecisions.delete(cacheKey);
+    if (this.#autoDecisions.size >= GITHUB_AUTO_SESSION_CACHE_MAX_ENTRIES) {
+      const oldestKey = this.#autoDecisions.keys().next().value;
+      if (oldestKey !== undefined) this.#autoDecisions.delete(oldestKey);
+    }
+    this.#autoDecisions.set(cacheKey, decision);
+  }
+
+  /** The account's host, or the provider default when the credential is unreadable. */
+  #baseUrl(context: ProviderDispatchContext): string {
+    const secret = context.credential.secret;
+    if (secret === undefined || secret.length === 0) return this.#fallbackBaseUrl;
+    try {
+      return `https://${parseGithubCredential(new TextDecoder().decode(secret)).apiHost}`;
+    } catch {
+      return this.#fallbackBaseUrl;
+    }
+  }
+
+  protected override async prepareHeaders(
+    context: ProviderDispatchContext,
+    request: CanonicalRequest,
+    candidate: ProviderDispatchTarget,
+  ): Promise<Record<string, string>> {
+    const credentialSecret = context.credential.secret;
+    if (credentialSecret !== undefined && credentialSecret.length > 0) {
+      const credential = parseGithubCredential(new TextDecoder().decode(credentialSecret));
+      assertGithubProfileMatchesMode(credential);
+      if (credential.profile === "opencode-copilot") {
+        const opencode = await this.#opencodeStyleHeaders(context, request, credential);
+        const token = this.#autoSessionTokens.get(request);
+        if (token !== undefined) opencode["Copilot-Session-Token"] = token;
+        return opencode;
+      }
+    }
+    const headers = await super.prepareHeaders(context, request, candidate);
+    // The Copilot API rejects a request that does not identify a Copilot
+    // client, so these are a protocol requirement. `applyRouteUserAgent` has
+    // already run inside the shared pipeline, so the identity is stamped after
+    // it and wins — the route-level User-Agent is for generic OpenAI-compatible
+    // hosts and would be rejected here.
+    Object.assign(headers, GITHUB_REQUEST_HEADERS);
+    const referenceSecret = context.credential.secret;
+    let parsedCredential: ReturnType<typeof parseGithubCredential> | undefined;
+    if (referenceSecret !== undefined && referenceSecret.length > 0) {
+      try {
+        parsedCredential = parseGithubCredential(new TextDecoder().decode(referenceSecret));
+      } catch {
+        // Unparseable credential; fall back to the reference identity below.
+      }
+    }
+    if (parsedCredential !== undefined) assertGithubProfileMatchesMode(parsedCredential);
+    const autoSessionToken = this.#autoSessionTokens.get(request);
+    // Auto-selected requests in either profile keep the session token returned
+    // by Cartethyia's /auto selection step.
+    if (autoSessionToken !== undefined) {
+      headers["Copilot-Session-Token"] = autoSessionToken;
+    }
+    const requestId = context.request_id ?? randomUUID();
+    // Reference (`_mixinHeaders` + request path): the interaction id is a
+    // separate value from the request id (`X-Request-Id`), and the Copilot
+    // client identity is stamped as `VScode-SessionId`/`VScode-MachineId`.
+    // The library version header carries the fetcher library id (`node-http`
+    // etc.), not the extension version — we previously sent the extension
+    // version there, which the upstream reads as a different client fingerprint.
+    const interactionId = randomUUID();
+    // Machine id is per-account (stable derive from install id + account
+    // fingerprint), so a pooled gateway does not make every account look like
+    // one device.
+    const accountKey =
+      parsedCredential === undefined
+        ? undefined
+        : createHash("sha256")
+            .update(`${parsedCredential.apiHost}:${parsedCredential.access}`)
+            .digest("hex");
+    const { sessionId, machineId } = await githubCopilotClientIds(accountKey);
+    Object.assign(headers, {
+      "editor-device-id": machineId,
+      "VScode-MachineId": machineId,
+      "VScode-SessionId": sessionId,
+      "openai-intent": "conversation-agent",
+      // Reference stamps `Openai-Organization` on HTTP chat requests.
+      ...(candidate?.wire_family === "chat" ? { "Openai-Organization": "github-copilot" } : {}),
+      "x-agent-task-id": requestId,
+      "x-interaction-id": interactionId,
+      "x-initiator": isAgentInitiated(request) ? "agent" : "user",
+      "x-interaction-type": "conversation-agent",
+      "x-request-id": requestId,
+      "x-vscode-user-agent-library-version": "node-http",
+    });
+    // The copy Claude family is served on the native Anthropic Messages wire,
+    // which gates feature betas behind `anthropic-beta` (mirroring the
+    // Copilot extension's `getAnthropicBetaHeader`). Adaptive thinking is the
+    // baseline the model roster declares, so it is requested for every messages
+    // route; the header is scoped to that wire and never sent elsewhere.
+    if (candidate?.wire_family === "messages") {
+      headers["anthropic-beta"] = "interleaved-thinking-2025-05-14";
+    }
+    if (allParts(request).some(containsImage)) {
+      headers["copilot-vision-request"] = "true";
+    } else {
+      delete headers["copilot-vision-request"];
+    }
+    if (parsedCredential !== undefined) {
+      headers.authorization = `Bearer ${parsedCredential.access}`;
+    }
+    return headers;
+  }
+
+  protected override async executeTransport(
+    headers: Record<string, string>,
+    payload: unknown,
+    context: ProviderDispatchContext,
+    _request?: CanonicalRequest,
+    candidate?: ProviderDispatchTarget,
+  ): Promise<Response> {
+    // The host comes from the credential, which the shared config cannot see,
+    // so the request is issued here against the resolved base URL instead of
+    // the registered one. Everything else — the payload, the headers, the
+    // deadline lifecycle — is what the shared pipeline produced.
+    const endpointPath = candidate?.endpoint_path && candidate.endpoint_path.length > 0
+      ? candidate.endpoint_path
+      : GITHUB_ENDPOINT_PATH;
+    const url = `${this.#baseUrl(context).replace(/\/+$/, "")}${endpointPath}`;
+    const outboundFetch = context.outbound_fetch ?? this.#fetch ?? globalThis.fetch;
+    const upstream = await postUpstreamJson(url, headers, payload as Record<string, unknown>, context, outboundFetch);
+    upstream.release();
+    return upstream.res;
+  }
+}
+
+/** GitHub Copilot provider adapter. */
+export const githubAdapter: ProviderAdapter = new GithubAdapter(
+  providerBaseUrl(GITHUB_PROVIDER_ID),
+);

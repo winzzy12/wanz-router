@@ -1,0 +1,30 @@
+import { Elysia, t, type AnyElysia } from "elysia";
+import { consoleErrorHandler, requireGlobalAdmin, requireTenantScope } from "../shared/errors";
+import { parseQueryLimit } from "../shared/query";
+import type { AuditRoutesConfig } from "./contracts";
+
+const listQuery = t.Object({
+  limit: t.Optional(t.String()),
+  cursor: t.Optional(t.String()),
+  action: t.Optional(t.String()),
+  actor: t.Optional(t.String()),
+});
+
+export function createAuditRoutes(config: AuditRoutesConfig): AnyElysia {
+  return new Elysia()
+    .error(consoleErrorHandler("Audit read failed"))
+    .get("/audit", { query: listQuery }, async ({ request, query }) => {
+      const resolved = config.accessResolver(request);
+      const access = requireGlobalAdmin(resolved);
+      const { tenantId } = requireTenantScope(resolved, "dashboard:read");
+      const limit = parseQueryLimit(query.limit, 50, 200);
+      return await config.store.list({
+        tenantId,
+        platformAdmin: access.scopes.includes("platform:admin"),
+        limit,
+        ...(query.cursor ? { cursor: query.cursor } : {}),
+        ...(query.action ? { action: query.action } : {}),
+        ...(query.actor ? { actor: query.actor } : {}),
+      });
+    });
+}

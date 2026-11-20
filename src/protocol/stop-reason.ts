@@ -1,0 +1,103 @@
+import type { CanonicalStopReason, CanonicalTerminalEvent } from "./canonical-model";
+
+/**
+ * Canonical stop reason mapped onto each surface's wire vocabulary.
+ *
+ * One table, one column per surface. The surfaces genuinely disagree — Chat
+ * reports a refusal as `content_filter` so a refusal is never hidden as a
+ * usable completion, Messages reports its own `refusal`, and only Messages has
+ * a `pause_turn` word — so the divergence is data here rather than four
+ * near-identical switch blocks that drift apart.
+ *
+ * `satisfies` keeps the table exhaustive: a new canonical reason that no column
+ * covers fails to compile instead of silently falling through to a default.
+ */
+const WIRE_STOP_REASONS = {
+  chat: {
+    stop: "stop",
+    length: "length",
+    tool_use: "tool_calls",
+    content_filter: "content_filter",
+    refusal: "content_filter",
+    error: "error",
+    cancelled: "error",
+    pause_turn: "stop",
+  },
+  messages: {
+    stop: "end_turn",
+    length: "max_tokens",
+    tool_use: "tool_use",
+    content_filter: "refusal",
+    refusal: "refusal",
+    error: "end_turn",
+    cancelled: "end_turn",
+    pause_turn: "pause_turn",
+  },
+} satisfies Record<string, Record<CanonicalStopReason, string>>;
+
+type StopReasonWireFamily = keyof typeof WIRE_STOP_REASONS;
+
+/**
+ * Maps a canonical stop reason onto `wire`'s vocabulary, falling back when the
+ * terminal carried none: Chat has no null finish_reason and defaults to `stop`,
+ * while Messages omits `stop_reason` entirely.
+ */
+function canonicalStopReasonToWire(
+  wire: StopReasonWireFamily,
+  reason: CanonicalStopReason | undefined,
+  fallback: string,
+): string {
+  if (reason === undefined) return fallback;
+  return WIRE_STOP_REASONS[wire][reason];
+}
+
+/** Chat's finish_reason, defaulting to `stop`. */
+export function chatFinishReason(reason: CanonicalStopReason | undefined): string {
+  return canonicalStopReasonToWire("chat", reason, "stop");
+}
+
+/**
+ * Chat's finish_reason for a terminal the encoders know the state of (F-35).
+ *
+ * The plain `chatFinishReason` default is only sound for a COMPLETE terminal:
+ * an aborted or failed terminal with no recorded reason is a turn that never
+ * finished, and "stop" tells agent clients it did — truncated output read as
+ * a finished answer. Non-complete terminals without a reason map to the
+ * table's own failure word (`error`), the same word the table already chose
+ * for canonical `cancelled`/`error`; a terminal that does carry a reason maps
+ * through the table unchanged.
+ */
+export function chatFinishReasonForTerminal(
+  reason: CanonicalStopReason | undefined,
+  state: "complete" | "failed" | "aborted",
+): string {
+  if (reason === undefined && state !== "complete") return "error";
+  return canonicalStopReasonToWire("chat", reason, "stop");
+}
+
+/**
+ * Completion's finish_reason, or `null` when the terminal recorded none.
+ *
+ * Completion inherits chat's wire vocabulary (`length`, `content_filter`,
+ * `stop`) but keeps its own convention: a terminal that is not complete
+ * (failed/aborted) already surfaced its failure elsewhere, so it yields
+ * `null` rather than a stop word, and a complete terminal flattens every
+ * reason other than `length`/`content_filter` to `stop`. The sync adapter and
+ * the streaming encoder both derive through this function so the two halves
+ * of the completion surface cannot drift.
+ */
+export function completionFinishReason(
+  reason: CanonicalStopReason | undefined,
+  state: CanonicalTerminalEvent["state"],
+): string | null {
+  if (state !== "complete") return null;
+  if (reason === "length" || reason === "content_filter") {
+    return canonicalStopReasonToWire("chat", reason, "stop");
+  }
+  return "stop";
+}
+
+/** Messages' stop_reason, or `null` when the terminal recorded none. */
+export function messagesStopReason(reason: CanonicalStopReason | undefined): string | null {
+  return reason === undefined ? null : canonicalStopReasonToWire("messages", reason, "end_turn");
+}

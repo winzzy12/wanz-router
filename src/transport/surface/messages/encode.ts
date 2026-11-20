@@ -1,0 +1,315 @@
+import type { CanonicalEvent, CanonicalStopReason, ContentPart, UsageRecord } from "../../../protocol/canonical-model";
+import { assertBoundedJsonDepth, isRecord } from "../../../protocol/codecs";
+import { messagesStopReason } from "../../../protocol/stop-reason";
+import { reasoningTextOf } from "../../../protocol/reasoning-text";
+import { toolIdentityKey } from "../../../protocol/tool-identity";
+import { repairToolArguments } from "../../../protocol/tool-repair-args";
+import {
+  reasoningSummaryHasBoundary,
+  reasoningSummaryIdentity,
+  reasoningSummarySeparator,
+  type ReasoningSummaryIdentity,
+} from "../reasoning-summary";
+import type { MessagesWireObject } from "./parse";
+import { lastEventOfType } from "../adapters";
+import { GatewayError } from "../../../protocol/gateway-error";
+
+/**
+ * Requires a provider-emitted tool call to carry a real name before it reaches
+ * the Messages wire.
+ *
+ * `tool_use.name` is mandatory on the wire and the client resolves it against
+ * the tools it actually has, so substituting a placeholder like `"tool"`
+ * converts a recoverable upstream omission into a confusing "unknown tool"
+ * rejection on the client. The inbound parser already refuses a `tool_use`
+ * with no name (`parse.ts`), so failing here keeps both wire directions
+ * symmetric instead of the outbound side inventing a name.
+ */
+export function requireMessagesToolName(name: string | undefined, callId: string): string {
+  if (typeof name === "string" && name.trim().length > 0) return name;
+  throw new GatewayError(
+    "transport_unavailable",
+    502,
+    "Upstream tool call is missing a tool name (request {requestId}). The upstream came back empty-handed — retry 🌙",
+    { callId, reason: "missing_tool_name" },
+    "upstream",
+  );
+}
+
+function parseArgs(value: unknown): unknown {
+  if (typeof value !== "string") return value ?? {};
+  // Anthropic requires `input` to be an object: a zero-arg call's "" (or
+  // whitespace) must become {}, never be forwarded as a bare string.
+  if (value.trim().length === 0) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    // Same reasoning as `primitives.parseArguments`: the ingress depth guard
+    // measured the envelope, not this string's contents, so the nesting has to
+    // be bounded the moment it becomes visible.
+    assertBoundedJsonDepth(parsed);
+    return parsed;
+  } catch (error) {
+    if (error instanceof GatewayError) throw error;
+    // F-26: repair applies at the boundary where the arguments become a
+    // complete value — the same jsonrepair pass the Chat encoder applies —
+    // so a bridged upstream's truncated object reaches the client as a
+    // `tool_use` block with strict JSON input instead of a raw string the
+    // wire rejects.
+    const repaired = repairToolArguments(value);
+    if (repaired !== value) {
+      try {
+        const parsed = JSON.parse(repaired) as unknown;
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          assertBoundedJsonDepth(parsed);
+          return parsed;
+        }
+      } catch {
+        // fall through to the raw value below
+      }
+    }
+    return value;
+  }
+}
+
+export function blockFromPart(part: ContentPart): MessagesWireObject | undefined {
+  switch (part.kind) {
+    case "text":
+      return { type: "text", text: part.text };
+    case "image":
+      return isRecord(part.payload) ? part.payload : { type: "image", source: part.payload };
+    case "file":
+      return {
+        type: "document",
+        source: part.file_id
+          ? { type: "file", file_id: part.file_id }
+          : { type: "base64", media_type: part.media_type, data: part.data },
+        ...(part.filename === undefined ? {} : { title: part.filename }),
+      };
+    case "document":
+      return {
+        type: "document",
+        source: { type: "base64", media_type: part.media_type, data: part.data },
+        ...(part.title === undefined ? {} : { title: part.title }),
+        ...(part.citations === undefined ? {} : { citations: { enabled: part.citations } }),
+      };
+    case "audio":
+      return { type: "audio", source: { type: "base64", media_type: part.media_type, data: part.data } };
+    case "refusal":
+      return { type: "text", text: part.text };
+    case "toolCall":
+      // No `index`: it is a streaming-position field, and the Anthropic
+      // `tool_use` block has no such key in either direction — the API answers
+      // `tool_use.index: Extra inputs are not permitted`. A canonical
+      // `toolCall` carries one because the Chat/Responses parsers stamp every
+      // call with its array position, so copying it here leaked a stream-only
+      // field into the block. The block's position in `content[]` already
+      // expresses the order, and the SSE writer assigns stream indices itself.
+      return {
+        type: "tool_use",
+        id: part.call_id,
+        name: part.name,
+        input: parseArgs(part.arguments),
+      };
+    case "toolResult": {
+      const content =
+        typeof part.content === "string"
+          ? part.content
+          : part.content.flatMap((p) => {
+              const block = blockFromPart(p);
+              return block === undefined ? [] : [block];
+            });
+      return {
+        type: "tool_result",
+        tool_use_id: part.call_id,
+        content,
+        ...(part.is_error ? { is_error: true } : {}),
+      };
+    }
+    case "reasoning": {
+      if (part.opaque)
+        return isRecord(part.payload)
+          ? part.payload
+          : { type: "redacted_thinking", data: part.payload };
+      return {
+        type: "thinking",
+        thinking: reasoningTextOf(part) ?? "",
+        ...(part.signature === undefined ? {} : { signature: part.signature }),
+      };
+    }
+    case "extension": {
+      if (
+        isRecord(part.payload) &&
+        (part.name === "server_tool_use" ||
+          part.name === "search_result" ||
+          part.name === "web_search_tool_result" ||
+          part.name === "document")
+      )
+        return part.payload;
+      // Messages-native unknown types (`messages:*`, e.g. a newer Anthropic
+      // block the parser does not know yet) round-trip under their native
+      // type. Foreign-surface annotations (`responses:*`, chat `audio`,
+      // `unknown`) have no Messages representation — emitting them would hand
+      // strict clients a block type they reject, so they degrade away here.
+      if (
+        isRecord(part.payload) &&
+        part.name.startsWith("messages:") &&
+        part.name !== "messages:unknown"
+      )
+        return {
+          type: part.name.slice("messages:".length),
+          ...(part.payload as Record<string, unknown>),
+        };
+      return undefined;
+    }
+  }
+}
+
+export function groupedBlocks(events: readonly CanonicalEvent[]): {
+  blocks: MessagesWireObject[];
+  droppedUnnamedToolCalls: number;
+} {
+  const blocks: MessagesWireObject[] = [];
+  let previousReasoningIdentity: ReasoningSummaryIdentity | undefined;
+  let previousReasoningText: string | undefined;
+  let droppedUnnamedToolCalls = 0;
+  // Fragments per call identity (F-24), retained ACROSS flushes: a flush
+  // ships the block as it stands, and a later fragment (an interleaved
+  // parallel stream's continuation) updates the same block in place instead
+  // of being dropped by the old flush-and-clear (F-37 — the sync twin of the
+  // stream path's state wipe).
+  const toolArguments = new Map<
+    string,
+    { name?: string; rawId: string; chunks: string[]; block?: MessagesWireObject; counted?: true }
+  >();
+  const flushTools = (final: boolean): void => {
+    for (const call of toolArguments.values()) {
+      // Never a placeholder: see `requireMessagesToolName`. A call the
+      // upstream never named cannot be expressed on the wire at all, so it is
+      // dropped and counted (once, at the final flush) — the caller downgrades
+      // `tool_use` to `end_turn` rather than failing the whole response over a
+      // recoverable omission.
+      if (call.name === undefined || call.name.trim().length === 0) {
+        if (final && call.counted === undefined) {
+          call.counted = true;
+          droppedUnnamedToolCalls += 1;
+        }
+        continue;
+      }
+      const input = parseArgs(call.chunks.join(""));
+      if (call.block === undefined) {
+        call.block = { type: "tool_use", id: call.rawId, name: call.name, input };
+        blocks.push(call.block);
+      } else {
+        // A continuation after the block shipped: the same block grows.
+        call.block["input"] = input;
+      }
+    }
+    if (final) toolArguments.clear();
+  };
+  for (const event of events) {
+    if (event.type === "tool_call_delta") {
+      const key = toolIdentityKey(event.call_id);
+      const previous = toolArguments.get(key);
+      const chunks = previous?.chunks ?? [];
+      chunks.push(event.arguments_delta ?? "");
+      const name = event.name ?? previous?.name;
+      toolArguments.set(key, {
+        rawId: previous?.rawId ?? event.call_id,
+        // Absent until some delta names the call; sticky once seen.
+        ...(name === undefined ? {} : { name }),
+        // The block shipped at an earlier flush is retained so the
+        // continuation updates it in place instead of forking a second block.
+        ...(previous?.block === undefined ? {} : { block: previous.block }),
+        ...(previous?.counted === undefined ? {} : { counted: previous.counted }),
+        chunks,
+      });
+      continue;
+    }
+    flushTools(false);
+    if (event.type === "content_delta") {
+      // Foreign extensions (responses:*, chat audio, …) have no Messages
+      // representation and degrade away instead of reaching the client as a
+      // block type it rejects.
+      const next = blockFromPart(event.content);
+      if (next === undefined) continue;
+      const previous = blocks.at(-1);
+      if (next.type === "text" && previous?.type === "text") {
+        previous.text = `${String(previous.text ?? "")}${String(next.text ?? "")}`;
+        previousReasoningIdentity = undefined;
+        previousReasoningText = undefined;
+      } else if (next.type === "thinking" && previous?.type === "thinking") {
+        const identity = reasoningSummaryIdentity(event);
+        const nextText = typeof next.thinking === "string" ? next.thinking : "";
+        const separator = reasoningSummarySeparator(
+          previousReasoningIdentity,
+          identity,
+          previousReasoningText,
+          nextText,
+        );
+        // A thinking block splits only on a strong boundary (a real paragraph
+        // break). Copilot streams one thought as many items; treating every
+        // identity change as a new block painted dozens of tiny thinking blocks.
+        if (reasoningSummaryHasBoundary(previousReasoningIdentity, identity) && separator === "\n\n") {
+          next.thinking = `${separator}${nextText}`;
+          blocks.push(next);
+        } else {
+          previous.thinking = `${String(previous.thinking ?? "")}${separator}${nextText}`;
+        }
+        previousReasoningIdentity = identity;
+        previousReasoningText = nextText;
+      } else {
+        blocks.push(next);
+        previousReasoningIdentity =
+          next.type === "thinking" ? reasoningSummaryIdentity(event) : undefined;
+        previousReasoningText =
+          next.type === "thinking" && typeof next.thinking === "string" ? next.thinking : undefined;
+      }
+    } else if (event.type === "tool_result") {
+      previousReasoningIdentity = undefined;
+      previousReasoningText = undefined;
+      const resultBlock = blockFromPart({
+        kind: "toolResult",
+        call_id: event.call_id,
+        content: event.content,
+      });
+      if (resultBlock !== undefined) blocks.push(resultBlock);
+    }
+  }
+  flushTools(true);
+  return { blocks, droppedUnnamedToolCalls };
+}
+/**
+ * Messages' `stop_reason`, or `null` when the terminal recorded none — this
+ * wire omits the field rather than defaulting it.
+ */
+export function mapStopReason(reason: CanonicalStopReason | undefined): string | null {
+  return messagesStopReason(reason);
+}
+export function startModel(events: readonly CanonicalEvent[]): string | undefined {
+  const start = events.find(
+    (event) => event.type === "response_start" || event.type === "message_start",
+  );
+  const model = start !== undefined && "model" in start ? start.model : undefined;
+  return typeof model === "string" && model.length > 0 ? model : undefined;
+}
+
+export function stopData(events: readonly CanonicalEvent[]): {
+  reason: string | null;
+  usage?: UsageRecord;
+  failed: boolean;
+} {
+  const terminal = lastEventOfType(events, "terminal");
+  const usageEvent = lastEventOfType(events, "usage");
+  // A failed terminal — `failed`, or `aborted` (upstream stream error) —
+  // marks the response as failed. An explicit canonical `error` event before
+  // the terminal also fails it: the upstream declared a failure even when the
+  // terminal state alone does not.
+  const hasErrorEvent = events.some((event) => event.type === "error");
+  const failed = terminal?.state === "failed" || (terminal?.state === "aborted" && hasErrorEvent);
+  let reason: string | null;
+  if (terminal?.stop_reason !== undefined) reason = mapStopReason(terminal.stop_reason);
+  else reason = terminal?.state === "complete" ? "end_turn" : null;
+  if (terminal?.usage !== undefined) return { reason, usage: terminal.usage, failed };
+  if (usageEvent?.usage !== undefined) return { reason, usage: usageEvent.usage, failed };
+  return { reason, failed };
+}

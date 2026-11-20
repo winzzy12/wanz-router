@@ -1,0 +1,123 @@
+/**
+ * Catalog row projections and endpoint-path resolution shared by the console
+ * catalog stores.
+ *
+ * `endpointPathForProviderModel` encodes the endpoint precedence the Add-Model
+ * path and the public catalog must agree on: operator compatibility profile >
+ * the provider's own static catalog > the generic per-wire default, with the
+ * provider's base path stripped so a versioned root cannot double a `/v1`
+ * segment. `mapProviderRow` is the single `providers` row projection.
+ */
+import { isBundledProviderId } from "../../../providers/provider-contracts";
+import { BUILTIN_DEFAULT_ENDPOINTS } from "../../../protocol/codecs";
+
+import { providerDisplayName, providerServiceKinds, customProviderServiceKinds } from "../../../providers/provider-metadata";
+import type { CompatibilityProfile } from "../../../providers/provider-metadata";
+import { supportedWireFamiliesForProvider } from "../../../providers/discovery/probe-wire";
+import { providers } from "../../../persistence/schema";
+import type { WireFamily } from "../../../protocol/canonical-model";
+import type { ProviderRecord } from "./contracts";
+
+/**
+ * The one registry fact this module needs. Narrower than `ProviderRegistry` on
+ * purpose: the projection should not be able to reach a loader, so the type
+ * cannot drift into "call something expensive to answer a boolean".
+ */
+interface ProviderDiscoveryLookup {
+  hasModelDiscovery(providerId: string): boolean;
+}
+
+export const DEFAULT_ENDPOINT_BY_WIRE_FAMILY: Record<WireFamily, string> = BUILTIN_DEFAULT_ENDPOINTS;
+export function endpointPathForProviderModel(
+  wireFamily: WireFamily,
+  compatibilityProfile: unknown,
+  staticEndpoints?: Partial<Record<WireFamily, string>>,
+): string {
+  const profile =
+    compatibilityProfile !== null &&
+    typeof compatibilityProfile === "object" &&
+    !Array.isArray(compatibilityProfile)
+      ? (compatibilityProfile as CompatibilityProfile)
+      : undefined;
+  // Operator profile > the provider's own static catalog > the generic
+  // per-wire default.
+  //
+  // The path is returned as declared, never rewritten against the base URL.
+  // Stripping a segment the base already carried would paper over the mistake
+  // instead of surfacing it: a provider whose base is already versioned has to
+  // declare its own path, exactly as `cline` and `qianfan` do. A wrong URL
+  // should reach the operator as the wrong URL, not be quietly corrected into
+  // a different address that may or may not be the one they meant.
+  const endpointPath =
+    profile?.endpoint_paths_by_wire_family?.[wireFamily] ??
+    staticEndpoints?.[wireFamily] ??
+    DEFAULT_ENDPOINT_BY_WIRE_FAMILY[wireFamily];
+  return endpointPath;
+}
+
+/**
+ * Projects a `providers` row into the console's provider record shape.
+ *
+ * `supportsModelDiscovery` is read from the registry rather than derived from
+ * `isBuiltIn`. A builtin that registers a discovery resolver cannot list any
+ * model until an operator syncs it, so reporting `false` for every builtin
+ * leaves those providers permanently empty with the control hidden. The
+ * `|| !isBundledProviderId` tail keeps a BYOK row on `true`: it has no
+ * registration, and discovery is always available for one.
+ */
+export function mapProviderRow(
+  row: typeof providers.$inferSelect,
+  registry: ProviderDiscoveryLookup,
+): ProviderRecord {
+  const supportedWireFamilies = supportedWireFamiliesForProvider(
+    row.id,
+    row.wireFamilyDefault,
+    row.compatibilityProfile,
+  );
+  const compatibilityProfile = row.compatibilityProfile as CompatibilityProfile | null;
+  return {
+    providerId: row.id,
+    displayName: providerDisplayName(row.id),
+    tenantId: row.tenantId,
+    enabled: row.enabled,
+    isBuiltIn: isBundledProviderId(row.id),
+    configured: false,
+    requiresAccount: row.requiresAccount,
+    serviceKinds: isBundledProviderId(row.id)
+      ? providerServiceKinds(row.id)
+      : customProviderServiceKinds(compatibilityProfile),
+    // No model advertises search; see the note in provider-metadata.ts.
+    supportsWebSearch: false,
+    supportsModelDiscovery:
+      registry.hasModelDiscovery(row.id) || !isBundledProviderId(row.id),
+    ...(supportedWireFamilies ? { supportedWireFamilies } : {}),
+    ...(row.capabilityProfile
+      ? { capabilityProfile: row.capabilityProfile as Record<string, unknown> }
+      : {}),
+    ...(row.baseUrl ? { baseUrl: row.baseUrl } : {}),
+    ...(row.compatibilityProfile
+      ? { compatibilityProfile: row.compatibilityProfile as CompatibilityProfile }
+      : {}),
+  };
+}
+
+/**
+ * The account's still-active per-model backoffs, or `undefined` when none are.
+ *
+ * Expired entries are dropped rather than returned: the sweep that clears them
+ * runs on a timer, so between the deadline passing and the sweep a raw read
+ * would report a cooldown that is not in force.
+ */
+export function liveModelCooldowns(
+  raw: unknown,
+): { modelCooldowns: Record<string, string> } | undefined {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const now = Date.now();
+  const live: Record<string, string> = {};
+  for (const [modelId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== "string") continue;
+    const at = new Date(value).getTime();
+    if (Number.isFinite(at) && at > now) live[modelId] = value;
+  }
+  return Object.keys(live).length > 0 ? { modelCooldowns: live } : undefined;
+}

@@ -1,0 +1,174 @@
+// Live domain: process-local in-flight proxy request count, read from the
+// request state store's admission funnel (`transport/request/state`), plus
+// per-pool inflight usage from `NetworkPoolSelector` and tenant-filtered pool
+// health notifications. The streams push changes with a heartbeat; health data
+// is joined to the owning tenant before it leaves the process.
+//
+// Every endpoint requires `dashboard:read`. The global request count is
+// process-level; pool usage and health are filtered to the caller's tenant.
+
+import { Elysia, type AnyElysia } from "elysia";
+import { consoleErrorHandler, errorResponse, requireScope } from "../shared/errors";
+import type { ConsoleAccessResolver } from "../auth/access";
+/**
+ * The slice of the request state store the live view reads. Declared here
+ * rather than imported from `transport/`: the console must not depend on the
+ * transport layer, and it only needs the gauge surface. `ProxyRequestStateStore`
+ * satisfies this structurally.
+ */
+export interface LiveInFlightSource {
+  inFlightSnapshot(): InFlightSnapshot;
+  subscribeInFlight(listener: (snapshot: InFlightSnapshot) => void): () => void;
+}
+
+export interface InFlightSnapshot {
+  readonly inFlight: number;
+  readonly uniqueIps: number;
+}
+import type { NetworkPoolSelector } from "../../network/pool/selector";
+import { eq } from "drizzle-orm";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import { networkPools } from "../../persistence/schema";
+import { subscribePoolHealth } from "../../network/pool/health";
+import { poolByteSnapshot } from "../../network/pool/accounting";
+import { consoleSseResponse, createConsoleSseStream } from "./sse";
+import { subscribeRequestCompleted } from "../../observability/request-notify";
+
+interface LiveConfig {
+  readonly accessResolver: ConsoleAccessResolver;
+  readonly poolSelector?: NetworkPoolSelector;
+  readonly db?: CartethyiaDatabase;
+  /**
+   * Owns the live in-flight gauge. Optional so reduced compositions (route-only
+   * shell, console stubs) mount the pool/health endpoints without the gauge;
+   * absent means the in-flight endpoints report zero rather than failing.
+   */
+  readonly stateStore?: LiveInFlightSource;
+}
+
+const EMPTY_IN_FLIGHT: InFlightSnapshot = { inFlight: 0, uniqueIps: 0 };
+
+async function tenantPoolIds(
+  db: CartethyiaDatabase | undefined,
+  tenantId: string | null,
+): Promise<ReadonlySet<string> | undefined> {
+  if (!db) return undefined;
+  if (!tenantId) return new Set();
+  const rows = await db.select({ id: networkPools.id }).from(networkPools).where(eq(networkPools.tenantId, tenantId));
+  return new Set(rows.map((row) => row.id));
+}
+/**
+ * Joins measured egress bytes onto the selector's usage rows.
+ *
+ * The selector only knows concurrency, and byte accounting lives outside it
+ * (it is fed by the transport layer, not the scheduler), so the two are merged
+ * at the edge. Pools that have carried no traffic yet are absent from the byte
+ * snapshot and read as zero.
+ */
+function withPoolBytes<T extends { poolId: string; currentInflight?: number }>(
+  pools: readonly T[],
+): ReadonlyArray<T & { bytesSent: number; bytesReceived: number }> {
+  const bytes = new Map(poolByteSnapshot().map((row) => [row.poolId, row]));
+  // `snapshotPoolUsage()` only rows pools that currently hold a slot; an idle
+  // pool therefore drops out of the map and would read as 0B even though it
+  // already carried traffic this process. Union the byte snapshot so a pool
+  // that has bytes but no inflight still appears with its running total.
+  const merged = new Map<string, T>();
+  for (const pool of pools) merged.set(pool.poolId, pool);
+  for (const [poolId] of bytes) {
+    if (!merged.has(poolId)) {
+      merged.set(poolId, { poolId, currentInflight: 0 } as unknown as T);
+    }
+  }
+  return [...merged.values()].map((pool) => {
+    const row = bytes.get(pool.poolId);
+    return { ...pool, bytesSent: row?.sent ?? 0, bytesReceived: row?.received ?? 0 };
+  });
+}
+
+export function createLiveRoutes(config: LiveConfig): AnyElysia {
+  return new Elysia()
+    .error(consoleErrorHandler("Live operation failed"))
+    .get("/live/requests/stream", ({ request, set }) => {
+      const access = config.accessResolver(request);
+      requireScope(access, "dashboard:read");
+      const tenantId = access?.tenantId;
+      if (!tenantId) return errorResponse(new Error("Tenant required"), set, "Live operation failed");
+      // No `set.headers` writes here: this handler returns a `Response`, so
+      // Elysia discards `set` and `consoleSseResponse` below owns the SSE
+      // headers (content-type, cache-control, connection, buffering).
+      return consoleSseResponse(
+        createConsoleSseStream(request.signal, ({ send }) => {
+          return subscribeRequestCompleted((notice) => {
+            if (notice.tenantId === tenantId) send("request_completed", notice);
+          });
+        }),
+      );
+    })
+    .get("/live/in-flight", ({ request }) => {
+      requireScope(config.accessResolver(request), "dashboard:read");
+      return config.stateStore?.inFlightSnapshot() ?? EMPTY_IN_FLIGHT;
+    })
+    .get("/live/in-flight/stream", ({ request }) => {
+      const access = requireScope(config.accessResolver(request), "dashboard:read");
+      const tenantId = access?.tenantId;
+      return consoleSseResponse(
+        createConsoleSseStream(request.signal, ({ send }) => {
+          const store = config.stateStore;
+          if (!store) {
+            send("count", EMPTY_IN_FLIGHT);
+            return () => {};
+          }
+          // The Usage page keeps one stream open for both the in-flight gauge
+          // and request-table invalidation, so this route also fans out
+          // `request_completed` events (tagged by kind) for the tenant,
+          // mirroring `/live/requests/stream`.
+          const unsubscribe = store.subscribeInFlight((snapshot) => send("count", snapshot));
+          let unsubscribeCompleted: (() => void) | undefined;
+          if (tenantId) {
+            unsubscribeCompleted = subscribeRequestCompleted((notice) => {
+              if (notice.tenantId === tenantId) send("request_completed", notice);
+            });
+          }
+          send("count", store.inFlightSnapshot());
+          return () => {
+            unsubscribe();
+            unsubscribeCompleted?.();
+          };
+        }),
+      );
+    })
+    .get("/live/pools", async ({ request }) => {
+      const access = requireScope(config.accessResolver(request), "dashboard:read");
+      const allowed = await tenantPoolIds(config.db, access.tenantId);
+      const pools = withPoolBytes(config.poolSelector?.snapshotPoolUsage() ?? []);
+      return { pools: allowed ? pools.filter((pool) => allowed.has(pool.poolId)) : pools };
+    })
+    .get("/live/pools/stream", async ({ request }) => {
+      let tenantId: string | null;
+      let allowed: ReadonlySet<string> | undefined;
+      const access = requireScope(config.accessResolver(request), "dashboard:read");
+      tenantId = access.tenantId;
+      allowed = await tenantPoolIds(config.db, tenantId);
+      const selector = config.poolSelector;
+      return consoleSseResponse(
+        createConsoleSseStream(request.signal, ({ send }) => {
+          const sendUsage = (pools: readonly { poolId: string; currentInflight: number }[]) => {
+            const merged = withPoolBytes(pools);
+            send("pools", {
+              pools: allowed ? merged.filter((pool) => allowed.has(pool.poolId)) : merged,
+            });
+          };
+          sendUsage(selector?.snapshotPoolUsage() ?? []);
+          const unsubscribeUsage = selector?.subscribePoolUsage(sendUsage);
+          const unsubscribeHealth = subscribePoolHealth((pool) => {
+            if (pool.tenantId === tenantId) send("health", pool);
+          });
+          return () => {
+            unsubscribeUsage?.();
+            unsubscribeHealth();
+          };
+        }),
+      );
+    });
+}

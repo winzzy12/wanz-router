@@ -1,0 +1,338 @@
+/**
+ * Hosted relay deployment: deploy a small relay worker to Cloudflare Workers,
+ * Vercel, or Deno Deploy, then register its URL as an HTTP network pool.
+ *
+ * Cartethyia already knows how to *use* a hosted relay: a pool whose endpoint
+ * host is `*.workers.dev` / `*.vercel.app` / `*.deno.dev` is classified as an
+ * application relay and dialed with `x-relay-target` / `x-relay-path` headers
+ * (see `network/pool/agent.ts` and `network/egress/fetch.ts`). This module
+ * supplies the other half — the operator does not have to write and deploy the
+ * worker by hand.
+ *
+ * The three providers differ only in their deploy API and their runtime entry
+ * shape, so each target contributes a `deploy` function; the worker *source* is
+ * one shared template, because the runtime contract (read `x-relay-target`,
+ * forward the body, return the upstream response) is identical on all three.
+ *
+ * Credentials are operator-supplied per deploy and never persisted: they are
+ * used for the deploy call and discarded. The resulting relay URL is a public
+ * host, which is what the network pool stores.
+ */
+import { GatewayError } from "../../../protocol/gateway-error";
+import { DEFAULT_RELAY_REGION, isRelayRegion } from "./relay-regions";
+
+/** A hosted relay target. */
+export type RelayTarget = "cloudflare" | "vercel" | "deno";
+
+export const RELAY_TARGETS: readonly RelayTarget[] = ["cloudflare", "vercel", "deno"];
+
+/**
+ * The relay worker source, deployed to every target.
+ *
+ * The contract: `x-relay-target` names the upstream origin and `x-relay-path`
+ * the upstream path+query; the worker forwards the request (method, body,
+ * headers) to `target + path` and returns the upstream response unchanged. The
+ * relay headers and `host` are stripped so the upstream sees a clean request.
+ * The same handler body runs on Workers and Vercel Edge (`export default {
+ * fetch }`); the Deno entry wraps it in `Deno.serve`.
+ */
+const RELAY_WORKER_SOURCE = `// Cartethyia hosted relay.
+//
+// Forwards a request to the origin named by the x-relay-target header, at the
+// path named by x-relay-path. Deployed to Cloudflare Workers / Vercel Edge.
+const handler = {
+  async fetch(request) {
+    const target = request.headers.get("x-relay-target");
+    const relayPath = request.headers.get("x-relay-path") || "/";
+    if (!target) {
+      return new Response(JSON.stringify({ error: "Missing x-relay-target header" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const targetUrl = target.replace(/\\/$/, "") + relayPath;
+    const headers = new Headers(request.headers);
+    headers.delete("x-relay-target");
+    headers.delete("x-relay-path");
+    headers.delete("x-relay-auth");
+    headers.delete("host");
+    const init = { method: request.method, headers };
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      init.body = request.body;
+      init.duplex = "half";
+    }
+    try {
+      const response = await fetch(targetUrl, init);
+      // Forward the body verbatim. Content-encoding/content-length must be
+      // stripped: the relay's own runtime already decoded the stream it hands
+      // us, so re-sending the original gzip headers makes the caller decompress
+      // twice (ZlibError). The body bytes are already plaintext here.
+      const headers = new Headers(response.headers);
+      headers.delete("content-encoding");
+      headers.delete("content-length");
+      return new Response(response.body, { status: response.status, headers });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String((error && error.message) || error) }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+  },
+};
+export default handler;
+`;
+
+/** A Deno Deploy entry wraps the shared handler in `Deno.serve`. */
+const RELAY_DENO_SOURCE = `${RELAY_WORKER_SOURCE}
+Deno.serve((request) => handler.fetch(request));
+`;
+
+/** Request to deploy one relay. */
+export interface RelayDeployRequest {
+  readonly target: RelayTarget;
+  /** Provider API token (Cloudflare API token, Vercel token, Deno token). */
+  readonly token: string;
+  /** Cloudflare account id; required for `cloudflare`, ignored otherwise. */
+  readonly accountId?: string;
+  /** Project/worker name; a generated name is used when absent. */
+  readonly projectName?: string;
+  /**
+   * Vercel function region; ignored by the other targets. Defaults to
+   * `DEFAULT_RELAY_REGION` when absent.
+   */
+  readonly region?: string;
+}
+
+/** Result of a deploy: the public relay URL, ready to register as a pool. */
+export interface RelayDeployResult {
+  readonly target: RelayTarget;
+  readonly relayUrl: string;
+  readonly projectName: string;
+}
+
+/** Outbound fetch seam (the validated fetch), so tests can stub deploys. */
+type RelayFetch = (url: string, init: RequestInit) => Promise<Response>;
+
+function generateName(prefix: string): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+async function readError(res: Response): Promise<string> {
+  const text = await res.text().catch(() => "");
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>;
+      // Cloudflare nests `{ errors: [{ message }] }`; Vercel `{ error: { message } }`.
+      const errors = record.errors;
+      if (Array.isArray(errors) && errors.length > 0) {
+        const first = errors[0] as Record<string, unknown>;
+        if (typeof first?.message === "string") return first.message;
+      }
+      const error = record.error;
+      if (typeof error === "string") return error;
+      if (error && typeof error === "object") {
+        const message = (error as Record<string, unknown>).message;
+        if (typeof message === "string") return message;
+      }
+    }
+  } catch {
+    // Fall through to the raw body.
+  }
+  return text.slice(0, 240) || `HTTP ${res.status}`;
+}
+
+/**
+ * Deploys the relay worker to Cloudflare Workers and returns its
+ * `*.workers.dev` URL.
+ */
+async function deployCloudflare(
+  fetchImpl: RelayFetch,
+  request: RelayDeployRequest,
+): Promise<RelayDeployResult> {
+  const accountId = request.accountId?.trim();
+  if (!accountId) throw new GatewayError("invalid_request", 400, "Cloudflare account id is required. Check the shape of what you sent — then resend 🪞");
+  const projectName = request.projectName?.trim() || generateName("relay");
+  const scriptUrl = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(projectName)}`;
+  const form = new FormData();
+  form.append(
+    "index.js",
+    new Blob([RELAY_WORKER_SOURCE], { type: "application/javascript+module" }),
+    "index.js",
+  );
+  form.append(
+    "metadata",
+    new Blob(
+      [JSON.stringify({ main_module: "index.js", compatibility_date: "2024-03-20" })],
+      { type: "application/json" },
+    ),
+    "metadata.json",
+  );
+  const upload = await fetchImpl(scriptUrl, {
+    method: "PUT",
+    headers: { authorization: `Bearer ${request.token}` },
+    body: form,
+  });
+  if (!upload.ok)
+    throw new GatewayError("platform_unavailable", upload.status, `Cloudflare deploy failed: ${await readError(upload)}. Flip the switch back on when ready 🔌`);
+  // Enable the workers.dev route; a failure here is non-fatal because the
+  // subdomain lookup below decides the final URL and reports its own error.
+  await fetchImpl(`${scriptUrl}/subdomain`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${request.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ enabled: true }),
+  }).catch(() => undefined);
+  const subdomainRes = await fetchImpl(
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/workers/subdomain`,
+    { headers: { authorization: `Bearer ${request.token}` } },
+  );
+  if (!subdomainRes.ok)
+    throw new GatewayError(
+      "platform_unavailable",
+      subdomainRes.status,
+      `Worker uploaded but its workers.dev subdomain could not be read: ${await readError(subdomainRes)}. Flip the switch back on when ready 🔌`,
+    );
+  const subdomainData = (await subdomainRes.json().catch(() => ({}))) as {
+    result?: { subdomain?: string };
+  };
+  const subdomain = subdomainData.result?.subdomain;
+  if (!subdomain)
+    throw new GatewayError(
+      "platform_unavailable",
+      502,
+      "Worker uploaded but no workers.dev subdomain is configured for this Cloudflare account. Flip the switch back on when ready 🔌",
+    );
+  return { target: "cloudflare", projectName, relayUrl: `https://${projectName}.${subdomain}.workers.dev` };
+}
+
+/**
+ * Deploys the relay worker to Vercel and returns its `*.vercel.app` URL.
+ *
+ * The region is set on the *project*, not on the deployment. A `regions` field
+ * on the deployment payload is accepted and reported back as the deployment's
+ * region, but the Function still runs wherever the project is pinned — so a
+ * per-deploy region silently does nothing. Setting it on the project is what
+ * actually moves egress to another country.
+ */
+async function deployVercel(
+  fetchImpl: RelayFetch,
+  request: RelayDeployRequest,
+): Promise<RelayDeployResult> {
+  const projectName = request.projectName?.trim() || generateName("relay");
+  const region = isRelayRegion(request.region) ? request.region : DEFAULT_RELAY_REGION;
+  const auth = { authorization: `Bearer ${request.token}`, "content-type": "application/json" };
+  // PATCH is used rather than POST /v1/projects because the project already
+  // exists once the first deployment lands; the first deploy below creates it,
+  // and this call is what pins its region before that deploy runs its build.
+  //
+  // `ssoProtection: null` disables Vercel Authentication (SSO) on the project.
+  // Without it every deployment is protected and answers `302 → vercel.com/
+  // sso-api` to anonymous callers — the relay URL exists but is not public.
+  await fetchImpl(`https://api.vercel.com/v9/projects/${encodeURIComponent(projectName)}`, {
+    method: "PATCH",
+    headers: auth,
+    body: JSON.stringify({ serverlessFunctionRegion: region, ssoProtection: null }),
+  }).catch(() => undefined);
+  const deployRes = await fetchImpl("https://api.vercel.com/v13/deployments", {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({
+      name: projectName,
+      target: "production",
+      regions: [region],
+      files: [
+        { file: "api/relay.js", data: RELAY_WORKER_SOURCE },
+        {
+          file: "vercel.json",
+          data: JSON.stringify({ rewrites: [{ source: "/(.*)", destination: "/api/relay" }] }),
+        },
+      ],
+      projectSettings: { framework: null },
+    }),
+  });
+  if (!deployRes.ok)
+    throw new GatewayError("platform_unavailable", deployRes.status, `Vercel deploy failed: ${await readError(deployRes)}. Flip the switch back on when ready 🔌`);
+  // Pin the region again after the deploy created the project: the PATCH above
+  // is a no-op on first deploy (the project does not exist yet), and a redeploy
+  // is what Vercel requires for a region change to take effect anyway. The SSO
+  // protection reset is repeated for the same reason — the first PATCH had no
+  // project to act on.
+  await fetchImpl(`https://api.vercel.com/v9/projects/${encodeURIComponent(projectName)}`, {
+    method: "PATCH",
+    headers: auth,
+    body: JSON.stringify({ serverlessFunctionRegion: region, ssoProtection: null }),
+  }).catch(() => undefined);
+  await fetchImpl("https://api.vercel.com/v13/deployments", {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({
+      name: projectName,
+      target: "production",
+      files: [
+        { file: "api/relay.js", data: RELAY_WORKER_SOURCE },
+        {
+          file: "vercel.json",
+          data: JSON.stringify({ rewrites: [{ source: "/(.*)", destination: "/api/relay" }] }),
+        },
+      ],
+      projectSettings: { framework: null },
+    }),
+  }).catch(() => undefined);
+  const deployment = (await deployRes.json().catch(() => ({}))) as { url?: string };
+  if (!deployment.url)
+    throw new GatewayError("platform_unavailable", 502, "Vercel deploy returned no URL. Flip the switch back on when ready 🔌");
+  return {
+    target: "vercel",
+    projectName,
+    relayUrl: deployment.url.startsWith("http") ? deployment.url : `https://${deployment.url}`,
+  };
+}
+
+/** Deploys the relay worker to Deno Deploy and returns its `*.deno.dev` URL. */
+async function deployDeno(
+  fetchImpl: RelayFetch,
+  request: RelayDeployRequest,
+): Promise<RelayDeployResult> {
+  const projectName = request.projectName?.trim() || generateName("relay");
+  const deployRes = await fetchImpl("https://dash.deno.com/api/deployments", {
+    method: "POST",
+    headers: { authorization: `Bearer ${request.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ project: projectName, entryPoint: "main.ts", files: { "main.ts": RELAY_DENO_SOURCE } }),
+  });
+  if (!deployRes.ok)
+    throw new GatewayError("platform_unavailable", deployRes.status, `Deno deploy failed: ${await readError(deployRes)}. Flip the switch back on when ready 🔌`);
+  const deployment = (await deployRes.json().catch(() => ({}))) as { url?: string; domains?: string[] };
+  const url = deployment.url ?? deployment.domains?.[0];
+  if (!url)
+    throw new GatewayError("platform_unavailable", 502, "Deno deploy returned no URL. Flip the switch back on when ready 🔌");
+  return {
+    target: "deno",
+    projectName,
+    relayUrl: url.startsWith("http") ? url : `https://${url}`,
+  };
+}
+
+const DEPLOYERS: Record<RelayTarget, (fetchImpl: RelayFetch, request: RelayDeployRequest) => Promise<RelayDeployResult>> = {
+  cloudflare: deployCloudflare,
+  vercel: deployVercel,
+  deno: deployDeno,
+};
+
+/** Whether `value` is a supported relay target. */
+export function isRelayTarget(value: unknown): value is RelayTarget {
+  return typeof value === "string" && (RELAY_TARGETS as readonly string[]).includes(value);
+}
+
+/**
+ * Deploys a relay to the requested target. `fetchImpl` is the validated
+ * outbound fetch (so the deploy call is SSRF-checked like every other egress);
+ * tests pass a stub.
+ */
+export async function deployRelay(
+  fetchImpl: RelayFetch,
+  request: RelayDeployRequest,
+): Promise<RelayDeployResult> {
+  if (!request.token.trim())
+    throw new GatewayError("invalid_request", 400, `${request.target} API token is required. Wrong key, right door — check the credential 🔑`);
+  return DEPLOYERS[request.target](fetchImpl, request);
+}

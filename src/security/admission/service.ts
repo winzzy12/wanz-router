@@ -1,0 +1,202 @@
+import { GatewayError } from "../../protocol/gateway-error";
+import { metrics } from "../../observability/metrics";
+import { getAdmissionIdentity, modelRejectionReason } from "../api-key-auth";
+import type {
+  AdmissionCounterStore,
+  AdmissionLease,
+  AdmissionRejectionReason,
+  ApiKeyAdmissionRequest,
+} from "./contracts";
+import { usageTokens } from "./buckets";
+import { admissionMetricLabel, reasonToGatewayError } from "./reasons";
+
+/** Persists reconciled lifetime token consumption for an API key. Injected so
+ *  the in-memory admission service stays decoupled from Drizzle/Postgres. */
+type LifetimeUsagePersister = (input: {
+  apiKeyId: string;
+  delta: number;
+}) => Promise<void>;
+
+/** Performs one atomic pre-dispatch admission and returns an idempotent attempt lease. */
+/** Reads the family's persisted `lifetime_tokens_consumed` fresh from the
+ * durable store — the row plus every child, sum included. Called lazily by the
+ * counter store only when it is about to seed a missing lifetime counter, so
+ * the ≤3s-stale snapshot value cannot freeze a low baseline in place. Injected
+ * so the admission module stays decoupled from Drizzle/Postgres. */
+type FreshLifetimeConsumedReader = (apiKeyId: string) => Promise<number | undefined>;
+
+
+export class ApiKeyAdmissionService {
+  constructor(
+    private readonly store: AdmissionCounterStore,
+    private readonly clock: () => number = () => Date.now(),
+    private readonly tenantConcurrencyProvider: (
+      tenantId: string,
+    ) => Promise<number | null> | number | null = () => null,
+    private readonly persistLifetimeUsage?: LifetimeUsagePersister,
+    private readonly freshLifetimeConsumed?: FreshLifetimeConsumedReader,
+    /**
+     * Hidden allowance above each key's concurrency limit. Injected rather
+     * than read from the snapshot so the number is operator configuration,
+     * not something a key can carry about itself.
+     */
+    private readonly concurrencyTolerance?: (
+      tenantId: string,
+    ) => Promise<number | null> | number | null,
+  ) {
+    if (!store) throw new Error("ApiKeyAdmissionService requires an admission store");
+  }
+
+  /**
+   * Drops all admission state for one key (revocation). Best-effort: a
+   * recycled key id must never inherit RPM/token/concurrency history.
+   */
+  async purgeKey(apiKeyId: string): Promise<void> {
+    await this.store.purge(apiKeyId).catch(() => undefined);
+  }
+
+  /**
+   * Seeds the current daily/monthly buckets from already-recorded spend so a
+   * newly added limit is enforced against the whole bucket, not just from the
+   * moment it was set. No-op when the store does not implement it.
+   */
+  async seedBuckets(request: {
+    readonly apiKeyId: string;
+    readonly now?: number;
+    readonly daily?: number;
+    readonly monthly?: number;
+  }): Promise<void> {
+    await this.store
+      .seedBuckets?.({ ...request, now: request.now ?? this.clock() })
+      .catch(() => undefined);
+  }
+
+  async admit(input: ApiKeyAdmissionRequest): Promise<AdmissionLease> {
+    const reject = (reason: AdmissionRejectionReason, detail: Record<string, unknown>): never => {
+      metrics.proxy_admission_total.inc(1, { reason: admissionMetricLabel(reason) });
+      throw reasonToGatewayError(reason, detail);
+    };
+
+    if (input.signal?.aborted) reject("admission-unavailable", { reason: "aborted" });
+
+    const snapshot = input.authorization;
+    if (!snapshot) reject("admission-unavailable", { reason: "missing_snapshot" });
+
+    const apiKeyId = getAdmissionIdentity(snapshot);
+    if (!apiKeyId || !snapshot.tenant_id) {
+      reject("admission-unavailable", { reason: "missing_snapshot" });
+    }
+    const rejected = modelRejectionReason(
+      snapshot,
+      input.targetModel,
+      input.targetProvider,
+      input.requestedModel,
+    );
+    if (rejected) {
+      reject(rejected, { model: input.targetModel });
+    }
+
+    const estimatedTokens = Math.max(
+      0,
+      Math.floor((input.estimatedInputTokens ?? 0) + (input.estimatedOutputTokens ?? 0)),
+    );
+    const now = this.clock();
+    const reservationId = `${apiKeyId}:${now}:${crypto.randomUUID()}`;
+    const rawTenantLimit = this.tenantConcurrencyProvider(snapshot.tenant_id);
+    const tenantLimit = rawTenantLimit instanceof Promise ? await rawTenantLimit : rawTenantLimit;
+    /*
+     * One number, one place. The allowance used to be overridable per key,
+     * so the tenant-wide value was only the answer for a key that had never
+     * been given one — an operator who raised it in Settings could not tell
+     * why one key still refused early, because the override lived in a modal
+     * the Settings page does not show. It is tenant-wide only now.
+     */
+    const rawTolerance = this.concurrencyTolerance?.(snapshot.tenant_id);
+    const tolerance = rawTolerance instanceof Promise ? await rawTolerance : rawTolerance;
+
+    try {
+      await this.store.reserve({
+        reservationId,
+        apiKeyId,
+        // rpm and concurrency are tracked per child key so each share recipient
+        // has its own independent window and slot. Token budgets (daily/monthly/
+        // lifetime) remain on `apiKeyId` (the parent) — the shared pool.
+        ...(snapshot.api_key_id !== apiKeyId ? { rpmConcurrencyKeyId: snapshot.api_key_id } : {}),
+        now,
+        estimatedTokens,
+        rpmLimit: snapshot.rpm ?? null,
+        dailyLimit: snapshot.daily_tokens ?? null,
+        monthlyLimit: snapshot.monthly_tokens ?? null,
+        lifetimeBudget: snapshot.lifetime_token_budget ?? null,
+        lifetimeConsumed: snapshot.lifetime_tokens_consumed ?? 0,
+        concurrencyLimit: snapshot.max_concurrent ?? null,
+        concurrencyTolerance: tolerance ?? null,
+        tenantId: snapshot.tenant_id,
+        tenantConcurrencyLimit: tenantLimit,
+        // Fresh lifetime reader is invoked by the store only when the counter
+        // is missing; the hot path reads Redis alone.
+        ...(this.freshLifetimeConsumed
+          ? { freshLifetimeConsumed: () => this.freshLifetimeConsumed!(apiKeyId) }
+          : {}),
+      });
+    } catch (error) {
+      if (error instanceof GatewayError) {
+        metrics.proxy_admission_total.inc(1, { reason: admissionMetricLabel(String(error.details.reason)) });
+        throw error;
+      }
+      metrics.proxy_admission_total.inc(1, { reason: "admission_unavailable" });
+      throw reasonToGatewayError("admission-unavailable", {
+        cause: error instanceof Error ? error.message : "unknown",
+      });
+    }
+
+    metrics.proxy_admission_total.inc(1, { reason: "ok" });
+
+    let finalized = false;
+    return {
+      reservationId,
+      apiKeyId,
+      get released() {
+        return finalized;
+      },
+      commitUsage: async (usage) => {
+        if (finalized) return;
+        const actual = usageTokens(usage);
+        await this.store.reconcile(apiKeyId, estimatedTokens, actual, reservationId);
+        // `finalized` is set only after the await, so two *concurrent*
+        // commitUsage calls on this lease could both pass the guard. Verified
+        // unreachable: the lease's only caller is `completeAttempt`, which sets
+        // `state.completed` synchronously before its first await, and every
+        // dispatch path funnels through that one guard — a retried completion
+        // returns early and never reaches this function twice. The store side
+        // is idempotent regardless (Redis reconcile no-ops on a committed
+        // lease; the in-memory store returns early on non-active state).
+        finalized = true;
+        // Persist the spend against BOTH the authenticating key and the family
+        // owner. The authenticating key (`snapshot.api_key_id`, the child for
+        // a share recipient) carries attribution so `sumChildrenConsumed` and
+        // recipient rows stay correct. The family owner (`admission_identity`,
+        // the template itself for a share child) is the live accumulator the
+        // console reads for total usage — without it the template column never
+        // moved and every figure depended on telemetry rows alone.
+        if (this.persistLifetimeUsage) {
+          const ownerId = snapshot.admission_identity ?? snapshot.api_key_id;
+          try {
+            await this.persistLifetimeUsage({ apiKeyId: snapshot.api_key_id, delta: actual });
+            if (ownerId !== snapshot.api_key_id) {
+              await this.persistLifetimeUsage({ apiKeyId: ownerId, delta: actual });
+            }
+          } catch {
+            // Non-fatal: the transient counter already reflects reality; a
+            // subsequent request will overwrite the row with the fresh count.
+          }
+        }
+      },
+      release: async () => {
+        if (finalized) return;
+        await this.store.release(apiKeyId, estimatedTokens, reservationId);
+        finalized = true;
+      },
+    };
+  }
+}

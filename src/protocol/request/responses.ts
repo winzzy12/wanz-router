@@ -1,0 +1,475 @@
+/**
+ * [OpenAI]-compatible /v1/responses request encoder: canonical → wire body.
+ */
+import type { CanonicalRequest } from "../canonical-model";
+import { clampToolCallId, isRecord } from "../codecs";
+import { markBreakpointsAtPositions } from "../../protocol/translation/cache-controls";
+import { normalizeGenerationControls, pickWireSupportedControls } from "../../protocol/translation/capabilities";
+import { resolveWireMaxTokens } from "../../protocol/translation/quirks";
+import type { DialectPolicy } from "../../protocol/translation/dialect/types";
+import type { ThinkingConfig } from "../../protocol/translation/dialect/thinking-ladder";
+import { resolveThinkingForModel } from "../../protocol/translation/dialect/thinking-ladder";
+import { clampThinkingLevelForModel } from "../../protocol/translation/dialect/model-thinking";
+import { isClaudeBillingHeaderText, resolveImageSource, resolveOutputVerbosity } from "../codecs";
+import { log } from "../../observability/logger";
+import { resolvePromptCacheKey } from "../../providers/operations/session-resolution";
+import { reasoningEffortFromIntent } from "../../protocol/reasoning";
+import { isWebSearchTool } from "../../protocol/translation/search";
+import { parseResponsesResponseToEvents, decodeResponsesSseStream } from "../response/responses";
+import { repairToolArguments } from "../tool-repair-args";
+
+const RESPONSES_CACHEABLE_BLOCK_TYPES: ReadonlySet<string> = new Set([
+  "input_text",
+  "output_text",
+  "input_image",
+  "input_file",
+  "input_audio",
+]);
+
+/** Marks the latest stable input block with an explicit prompt-cache breakpoint. */
+const RESPONSES_CACHE_PREDICATES = {
+  isInputItem: (item: Record<string, unknown>) =>
+    item["type"] === "message" && (item["role"] === "user" || item["role"] === "developer"),
+  isCacheableRole: (role: unknown) => role === "user" || role === "developer" || role === "system",
+  isCacheableBlock: (block: Record<string, unknown>) =>
+    typeof block["type"] === "string" && RESPONSES_CACHEABLE_BLOCK_TYPES.has(block["type"]),
+  writeMarker: (block: Record<string, unknown>) => (block["prompt_cache_breakpoint"] = { mode: "explicit" }),
+} as const;
+
+/** Renders a canonical computer-use result as a Responses `computer_screenshot`. */
+function computerOutputForWire(content: unknown): Record<string, unknown> {
+  if (typeof content === "string") return { type: "computer_screenshot", image_url: content };
+  if (Array.isArray(content)) {
+    const image = content.find((part) => isRecord(part) && part.kind === "image");
+    if (image !== undefined && isRecord(image)) {
+      // `image_url` must be a string on the wire; a canonical image part is an
+      // opaque origin payload (Anthropic `{type,source}`, Chat `{image_url:{url}}`,
+      // flat `{url}`), so resolve it rather than forwarding the object.
+      const source = resolveImageSource(image.payload);
+      const output: Record<string, unknown> = { type: "computer_screenshot" };
+      if (source?.url !== undefined) output["image_url"] = source.url;
+      else if (source?.fileId !== undefined) output["file_id"] = source.fileId;
+      if (source?.detail !== undefined) output["detail"] = source.detail;
+      return output;
+    }
+  }
+  return { type: "computer_screenshot" };
+}
+
+/**
+ * Responses top-level params carried as `extension:responses.<field>` and
+ * forwarded verbatim. Fields with a canonical slot (prompt_cache_key,
+ * previous_response_id, conversation, metadata, stream, reasoning) and nested
+ * artifacts (verbosity, read under `text` in the builder) are absent because
+ * they are re-emitted from `CanonicalRequest` instead. Module-level so the
+ * table is not rebuilt per request.
+ */
+const RESPONSES_EXTENSION_PASSTHROUGH: ReadonlyArray<string> = [
+  "store",
+  "background",
+  "truncation",
+  "max_tool_calls",
+  "include",
+  "prompt_cache_retention",
+  "stream_options",
+  "top_logprobs",
+  "moderation",
+  "safety_identifier",
+  "prompt",
+  "context_management",
+  "user",
+];
+
+/**
+ * F-9: the hosted-declaration fields THIS wire re-emits, per family. Keys in
+ * `hosted_fields` outside the set are dropped with a debug log — a field the
+ * ingress allowlist captured for another wire's vocabulary must not reach an
+ * upstream that rejects unknown fields.
+ */
+const RESPONSES_WEB_SEARCH_FIELDS: ReadonlySet<string> = new Set([
+  "search_context_size",
+  "user_location",
+  "filters",
+]);
+const RESPONSES_MCP_FIELDS: ReadonlySet<string> = new Set([
+  "server_label",
+  "server_url",
+  "allowed_tools",
+  "headers",
+  "require_approval",
+]);
+
+function pickHostedFields(
+  tool: { readonly name: string; readonly hosted_fields?: Record<string, unknown> },
+  allowed: ReadonlySet<string>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(tool.hosted_fields ?? {})) {
+    if (allowed.has(key)) out[key] = value;
+    else if (value !== undefined) log.debug("responses: dropping hosted tool field this wire does not carry", { tool: tool.name, field: key });
+  }
+  return out;
+}
+
+export function canonicalToResponsesPayload(
+  request: CanonicalRequest,
+  options: {
+    readonly supportsPromptCaching?: boolean;
+    readonly promptCacheKey?: string;
+    readonly dialectPolicy?: DialectPolicy;
+    readonly thinking?: ThinkingConfig;
+    readonly maxOutputTokens?: number;
+    /**
+     * F-20: the upstream does not persist responses — a
+     * `previous_response_id` (even a real `response.id` from an earlier turn)
+     * answers 404. Continuity comes from the full `input` history, so the
+     * codec strips the linkage fields once, declaratively, instead of every
+     * stateless provider deleting them in its own prePayload.
+     */
+    readonly statelessResponses?: boolean;
+  } = {},
+): Record<string, unknown> {
+  const supportsPromptCaching = options.supportsPromptCaching ?? true;
+  const resolvedThinking = options.thinking ?? resolveThinkingForModel(request.model, "", "responses");
+  const input: Array<Record<string, unknown>> = [];
+  // `pending_safety_checks` have no canonical content-part representation, so
+  // `parseResponsesRequest` retains them per-item in the scoped item-metadata
+  // extension. Restore them here so a computer-use turn replays losslessly.
+  const itemMetadata = request.generation_controls["extension:responses.item_metadata"];
+  const pendingSafetyChecks = (callId: string): unknown[] | undefined => {
+    if (!Array.isArray(itemMetadata)) return undefined;
+    const entry = itemMetadata.find(
+      (m) => isRecord(m) && m["type"] === "computer_call" && m["call_id"] === callId,
+    );
+    if (!isRecord(entry)) return undefined;
+    const checks = entry["pending_safety_checks"];
+    return Array.isArray(checks) ? checks : undefined;
+  };
+  for (const [parts, role] of [
+    [request.system, "system"],
+    [request.instructions, "developer"],
+  ] as const) {
+    if (!parts?.length) continue;
+    const content: Array<Record<string, unknown>> = [];
+    for (const part of parts) {
+      if (part.kind === "text" && !isClaudeBillingHeaderText(part.text))
+        content.push({ type: "input_text", text: part.text });
+    }
+    if (content.length) input.push({ type: "message", role, content });
+  }
+  for (const m of request.messages) {
+    const isAssistant = m.role === "assistant";
+    const pending: Array<Record<string, unknown>> = [];
+    const flushMessage = (): void => {
+      if (pending.length === 0) return;
+      const item: Record<string, unknown> = { type: "message", role: m.role, content: pending.splice(0) };
+      if (m.phase) item.phase = m.phase;
+      input.push(item);
+    };
+    for (const p of m.content) {
+      if (p.kind === "toolCall") {
+        flushMessage();
+        // Clamped here and in the result branch by the same helper, so a call
+        // and its output keep matching: OpenCode Zen rejects a `call_id` over
+        // 64 characters, and ids longer than that arrive from the client on
+        // every replay of the transcript.
+        const callId = clampToolCallId(p.call_id);
+        if (p.call_kind === "computer") {
+          const actions =
+            isRecord(p.arguments) && Array.isArray(p.arguments["actions"])
+              ? p.arguments["actions"]
+              : [];
+          const checks = pendingSafetyChecks(callId);
+          input.push({
+            type: "computer_call",
+            ...(p.item_id === undefined ? {} : { id: p.item_id }),
+            call_id: callId,
+            actions,
+            ...(checks === undefined ? {} : { pending_safety_checks: checks }),
+            status: "completed",
+          });
+        } else {
+          input.push({
+            type: "function_call",
+            ...(p.item_id === undefined ? {} : { id: p.item_id }),
+            call_id: callId,
+            name: p.name,
+            arguments: repairToolArguments(
+              typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments),
+            ),
+            ...(p.namespace === undefined ? {} : { namespace: p.namespace }),
+          });
+        }
+      } else if (p.kind === "toolResult") {
+        // Tool results arrive under `role: "tool"` (OpenAI Chat) OR `role: "user"`
+        // (Anthropic Messages, whose tool ledger re-homes them). Both must reach
+        // the provider as a `function_call_output`, never be swallowed into a
+        // bare message — that is what made a Messages-session tool loop lose its
+        // results when the target provider ran on the Responses wire.
+        flushMessage();
+        const callId = clampToolCallId(p.call_id);
+        if (p.call_kind === "computer") {
+          input.push({
+            type: "computer_call_output",
+            ...(p.item_id === undefined ? {} : { id: p.item_id }),
+            call_id: callId,
+            output: computerOutputForWire(p.content),
+            status: "completed",
+          });
+        } else {
+          input.push({
+            type: "function_call_output",
+            ...(p.item_id === undefined ? {} : { id: p.item_id }),
+            call_id: callId,
+            output: typeof p.content === "string" ? p.content : JSON.stringify(p.content),
+          });
+        }
+      } else if (p.kind === "reasoning" && p.encrypted_content !== undefined) {
+        flushMessage();
+        // Replays prior encrypted reasoning so the model retains continuity
+        // across turns; never decrypted or reconstructed from summary text.
+        // The upstream binds encrypted reasoning to the item it was issued
+        // for and rejects a replay whose id does not match ("Encrypted content
+        // item_id did not match the target item id"), so the item carries the
+        // id it was parsed with. Without one there is nothing to match and the
+        // payload would be rejected anyway — it is dropped rather than sent
+        // under an id the upstream cannot verify.
+        if (p.item_id !== undefined) {
+          input.push({ type: "reasoning", id: p.item_id, encrypted_content: p.encrypted_content });
+        }
+      } else if (p.kind === "reasoning") {
+        // Plain reasoning replayed from another surface (a Messages `thinking`
+        // block, or Chat `reasoning_content`). It has no encrypted artifact, so
+        // it travels as a summary the model can read on the next turn instead
+        // of being dropped — which is what made a cross-surface session lose
+        // its chain of thought the moment it reached a Responses provider.
+        const text =
+          typeof p.summary === "string"
+            ? p.summary
+            : typeof p.payload === "string"
+              ? p.payload
+              : undefined;
+        if (text !== undefined && text.length > 0) {
+          flushMessage();
+          input.push({
+            type: "reasoning",
+            summary: [{ type: "summary_text", text }],
+          });
+        }
+      } else if (p.kind === "text") {
+        pending.push({ type: isAssistant ? "output_text" : "input_text", text: p.text });
+      } else if (p.kind === "image") {
+        const source = resolveImageSource(p.payload);
+        if (source?.url !== undefined) {
+          pending.push({
+            type: "input_image",
+            image_url: source.url,
+            ...(source.detail === undefined ? {} : { detail: source.detail }),
+          });
+        } else if (source?.fileId !== undefined) {
+          pending.push({
+            type: "input_image",
+            file_id: source.fileId,
+            ...(source.detail === undefined ? {} : { detail: source.detail }),
+          });
+        } else {
+          pending.push({ type: "input_text", text: "[image: unsupported source]" });
+        }
+      } else if (p.kind === "file" || p.kind === "document") {
+        const isFile = p.kind === "file";
+        const sourceType = isFile ? undefined : p.source_type;
+        const fileId = p.file_id;
+        const filename = isFile ? p.filename : p.title;
+        const url = p.url;
+        if (sourceType === "text" && typeof p.data === "string") {
+          // Anthropic text documents are plain text; the Responses wire carries
+          // them as text rather than base64 `file_data`.
+          pending.push({ type: isAssistant ? "output_text" : "input_text", text: p.data });
+        } else {
+          const referenceOnly =
+            sourceType === "url" || sourceType === "file" || (url !== undefined && p.data === url);
+          const block: Record<string, unknown> = { type: "input_file" };
+          if (fileId !== undefined) block.file_id = fileId;
+          else if (url !== undefined && referenceOnly) block.file_url = url;
+          else if (p.data !== undefined && p.data !== null && p.data !== "")
+            block.file_data = p.data;
+          if (filename !== undefined) block.filename = filename;
+          pending.push(block);
+        }
+      } else if (p.kind === "audio") {
+        pending.push({ type: "input_audio", data: p.data, media_type: p.media_type });
+      } else if (p.kind === "refusal") {
+        pending.push({ type: isAssistant ? "output_text" : "input_text", text: p.text });
+      }
+      // `extension` (server_tool_use, search_result, …) has no Responses
+      // representation and degrades away silently.
+    }
+    flushMessage();
+  }
+  // F-34: the hint's positions are consumed — each listed n marks the
+  // Nth-from-last cacheable block, not just the latest one.
+  if (
+    supportsPromptCaching &&
+    request.cache_hint !== undefined &&
+    request.cache_hint !== "stable_prefix" &&
+    request.cache_hint.list.length > 0
+  ) {
+    markBreakpointsAtPositions(input, RESPONSES_CACHE_PREDICATES, request.cache_hint.list);
+  }
+  const payload: Record<string, unknown> = {
+    model: request.model,
+    input,
+    stream: request.stream,
+  };
+  const responsesCacheKey = options.promptCacheKey ?? resolvePromptCacheKey(request);
+  if (supportsPromptCaching && responsesCacheKey !== undefined)
+    payload.prompt_cache_key = responsesCacheKey;
+  if (request.tools?.length) {
+    payload["tools"] = request.tools.map((tool) => {
+      if (tool.tool_type === "custom") {
+        return {
+          type: "custom",
+          name: tool.name,
+          ...(tool.description === undefined ? {} : { description: tool.description }),
+          ...(isRecord(tool.jsonSchema) && Object.keys(tool.jsonSchema).length > 0
+            ? { format: tool.jsonSchema }
+            : {}),
+        };
+      }
+      // A hosted web-search tool is a first-class tool on this wire. Emitting
+      // the caller's Anthropic `web_search_*` payload verbatim sent Codex
+      // `{"type": null}` and a 400 ("Unsupported tool type: None"); Responses
+      // names the same capability `web_search_preview`. F-9: the declaration's
+      // configuration fields arrive in `hosted_fields` (ingress allowlist) and
+      // re-emit here — a search request used to arrive search-less.
+      if (isWebSearchTool(tool))
+        return {
+          type: "web_search_preview",
+          ...pickHostedFields(tool, RESPONSES_WEB_SEARCH_FIELDS),
+        };
+      // F-9: an MCP declaration re-emits its server configuration — without
+      // this the tool arrived server-less (and `jsonSchema` is `{}` for a
+      // hosted type, so the passthrough below emitted an empty object).
+      if (tool.tool_type === "mcp" && tool.hosted_fields !== undefined)
+        return { type: "mcp", ...pickHostedFields(tool, RESPONSES_MCP_FIELDS) };
+      if (tool.tool_type !== undefined && tool.tool_type !== "function" && isRecord(tool.jsonSchema))
+        return tool.jsonSchema;
+      return {
+        type: "function",
+        name: tool.name,
+        ...(tool.description === undefined ? {} : { description: tool.description }),
+        parameters: tool.jsonSchema,
+        ...(tool.strict === true ? { strict: true } : {}),
+        ...(tool.input_examples === undefined ? {} : { input_examples: tool.input_examples }),
+        ...(tool.defer_loading === undefined ? {} : { defer_loading: tool.defer_loading }),
+        ...(tool.allowed_callers === undefined ? {} : { allowed_callers: tool.allowed_callers }),
+      };
+    });
+  }
+  if (request.tool_choice) {
+    if (typeof request.tool_choice === "object" && request.tool_choice.type === "allowed_tools") {
+      payload.tool_choice = {
+        type: "allowed_tools",
+        mode: request.tool_choice.mode,
+        tools: request.tool_choice.names.map((name) => ({ type: "function", name })),
+      };
+    } else if (typeof request.tool_choice === "object" && request.tool_choice.type === "tool") {
+      payload.tool_choice = { type: "function", name: request.tool_choice.name };
+    } else if (typeof request.tool_choice === "object" && request.tool_choice.type === "custom") {
+      payload.tool_choice = { type: "custom", name: request.tool_choice.name };
+    } else {
+      payload.tool_choice = request.tool_choice;
+    }
+  }
+  if (options.statelessResponses !== true) {
+    // A stateful route preserves the linkage verbatim; a stateless one has no
+    // response store to look the id up in (F-20).
+    if (request.conversation?.previous_response_id !== undefined)
+      payload.previous_response_id = request.conversation.previous_response_id;
+    if (request.conversation?.conversation_id !== undefined)
+      payload.conversation = request.conversation.conversation_id;
+  }
+  if (request.metadata !== undefined) payload.metadata = request.metadata;
+  if (request.reasoning) {
+    const reasoning: Record<string, unknown> = {};
+    // `effort` is read through the shared intent translation, not off the
+    // intent directly: a Messages client states reasoning as
+    // `thinking: {type, budget_tokens}`, so reading `effort` alone dropped
+    // the intent on the floor whenever such a request was translated onto
+    // this wire. Codex already derives its tier this way.
+    const requestedEffort = reasoningEffortFromIntent(request.reasoning);
+    if (requestedEffort !== undefined) {
+      const effort = clampThinkingLevelForModel(resolvedThinking, requestedEffort);
+      if (effort !== undefined) reasoning.effort = effort;
+    }
+    if (request.reasoning.mode !== undefined) reasoning.mode = request.reasoning.mode;
+    if (request.reasoning.context !== undefined) reasoning.context = request.reasoning.context;
+    if (request.reasoning.summary_mode !== undefined)
+      reasoning.summary = request.reasoning.summary_mode;
+    else if (request.reasoning.summary !== undefined) reasoning.summary = request.reasoning.summary;
+    else if (requestedEffort !== undefined) reasoning.summary = "detailed";
+    // When the caller asked for reasoning effort but expressed no summary
+    // preference, request a detailed summary. Upstreams (GitHub Copilot's
+    // gpt-6-luna etc.) only stream `reasoning_summary_text` when the request
+    // asks for it — without this the reasoning is present on the wire yet
+    // never reaches the client.
+    if (Object.keys(reasoning).length > 0) payload.reasoning = reasoning;
+  }
+  const picked = pickWireSupportedControls(normalizeGenerationControls(request.generation_controls), "responses");
+  const requested =
+    typeof picked["max_output_tokens"] === "number" && Number.isFinite(picked["max_output_tokens"])
+      ? (picked["max_output_tokens"] as number)
+      : undefined;
+  // Resolved unconditionally so the wire's `defaultMaxTokens` applies: an
+  // omitted limit must reach the upstream as a real number, not as an absent
+  // field (see the worked "wkwk" case in the WIRE_TOKEN_BOUNDS comment).
+  const bounded = resolveWireMaxTokens("responses", { max_tokens: requested }, {
+    ...(options.maxOutputTokens === undefined ? {} : { maxOutputTokens: options.maxOutputTokens }),
+  });
+  if (bounded !== undefined) picked["max_output_tokens"] = bounded;
+  Object.assign(payload, picked);
+  for (const field of RESPONSES_EXTENSION_PASSTHROUGH) {
+    if (!supportsPromptCaching && field.startsWith("prompt_cache_")) continue;
+    // A bare `extension:<field>` fallback exists because the Chat parser files
+    // shared top-level params (`store`, `user`, `moderation`, …) under the bare
+    // key, and those have the same shape on every wire. `context_management`
+    // does NOT: the Messages parser stores Anthropic's map shape
+    // (`{edits: [...]}`) while this wire requires a sequence, so accepting the
+    // bare key here would forward a map and earn a 400 from the upstream. Only
+    // the Responses-spelled key may supply it.
+    const value =
+      request.generation_controls[`extension:responses.${field}`] ??
+      (field === "context_management"
+        ? undefined
+        : request.generation_controls[`extension:${field}` as `extension:${string}`]);
+    if (value !== undefined) payload[field] = value;
+  }
+  // Responses nests output verbosity and structured-output format under `text`.
+  const verbosity = resolveOutputVerbosity(request.generation_controls);
+  if (request.response_format !== undefined || verbosity !== undefined) {
+    const text = (payload["text"] as Record<string, unknown> | undefined) ?? {};
+    if (verbosity !== undefined) text["verbosity"] = verbosity;
+    const format = request.response_format;
+    if (format?.type === "json_object") {
+      text["format"] = { type: "json_object" };
+    } else if (format?.type === "json_schema") {
+      text["format"] = {
+        type: "json_schema",
+        ...(format.name === undefined ? {} : { name: format.name }),
+        ...(format.schema === undefined ? {} : { schema: format.schema }),
+        ...(format.strict === undefined ? {} : { strict: format.strict }),
+        ...(format.description === undefined ? {} : { description: format.description }),
+      };
+    }
+    payload["text"] = text;
+  }
+  return payload;
+}
+
+
+export const responsesCodecModule = {
+  family: "responses" as const,
+  encodeWireRequest: canonicalToResponsesPayload,
+  decodeWireResponse: parseResponsesResponseToEvents,
+  decodeWireStream: decodeResponsesSseStream,
+} as const;

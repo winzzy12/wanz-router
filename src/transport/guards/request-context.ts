@@ -1,0 +1,257 @@
+// Per-request context, client identity, canonical parse, and route preparation.
+import { Elysia } from "elysia";
+import { GatewayError } from "../../protocol/gateway-error";
+import type { TrustedProxyBoundary } from "../../config/network";
+import { resolveUpstreamTimeoutMs } from "../../config/timeouts";
+import type { ProxyRequestStateStore } from "../request/state";
+import { fastPathname } from "../pathname";
+import type { ProxyRequestPreparer } from "../request/preparer";
+import type { CanonicalAdapter } from "../contracts";
+import type { SurfaceAdapterRegistry } from "../surface/adapters";
+import { resolveClientIdentity } from "../../security/ip-boundary";
+import { GATEWAY_SECURITY_HEADERS } from "../../security/outbound-headers";
+import { pushStructuredConsoleLog } from "../../observability/log-ring";
+import { log } from "../../observability/logger";
+import { isProxyDispatchRoute } from "./body-policy";
+import { isOpaqueBodyRoute } from "../contracts";
+import { peerAddressUnavailableError } from "./guard-errors";
+import { SKIP_TENANT_SYSTEM_PROMPT_HEADER } from "../../protocol/system-prompt-contracts";
+
+
+
+interface RequestApp {
+  request(
+    handler: (context: { request: Request; set?: { headers: Record<string, string> } }) => void,
+  ): RequestApp;
+}
+
+/**
+ * Whether this request falls outside the canonical JSON-proxy pipeline the
+ * canonical-parse and route-preparation stages serve.
+ *
+ * Shared gate, applied in the exact order both middlewares historically
+ * checked: non-`/v1/` paths, GET/HEAD (which carry no body to parse), then
+ * the JSON route table with opaque-body routes excluded — `/v1/completions`
+ * needs no separate arm because it is already in the JSON routes table, and
+ * native routes (compact, System One, token count) read a body but are never
+ * parsed into a canonical request, their bodies being opaque by contract.
+ */
+function skipNonCanonicalProxyRequest(request: Request): boolean {
+  const path = fastPathname(request.url);
+  if (!path.startsWith("/v1/")) return true;
+  if (request.method === "GET" || request.method === "HEAD") return true;
+  return !isProxyDispatchRoute(path) || isOpaqueBodyRoute(path);
+}
+
+interface RequestContextDeps {
+  readonly stateStore: ProxyRequestStateStore;
+  readonly clock?: () => number;
+  /** Explicit deadline override; defaults to `CARTETHYIA_UPSTREAM_TIMEOUT_MS` (120s). */
+  readonly requestDeadlineMs?: number;
+}
+
+/**
+ * Initializes per-request `ProxyRequestState` before any other hook runs.
+ * Only gateway (`/v1/*`) requests get state: this middleware is mounted at
+ * the composition root so it also observes health checks, console traffic,
+ * and dashboard assets, but none of those use proxy state and none of them
+ * run the `/v1`-scoped cleanup hooks — initializing for them leaked a state,
+ * a deadline timer, a live-controller entry, and an in-flight count per
+ * request that was never reclaimed. Cleanup (abort + WeakMap eviction) is
+ * intentionally NOT done here via `afterResponse`: Elysia's afterResponse
+ * hook order across plugins is not something this composition can guarantee
+ * ahead of `createTelemetryLifecycleMiddleware`'s afterResponse (now in
+ * lifecycle.ts), which still needs to read the state. The WeakMap entry is
+ * reclaimed by GC once `request` is unreferenced; nothing needs to run after
+ * the response is sent.
+ */
+export function createRequestContextMiddleware(deps: RequestContextDeps): Elysia {
+  const app = new Elysia() as unknown as RequestApp;
+  app.request(({ request, set }) => {
+    const pathname = fastPathname(request.url);
+    if (pathname !== "/v1" && !pathname.startsWith("/v1/")) return;
+    const state = deps.stateStore.initialize(
+      request,
+      (deps.clock ?? (() => Date.now()))(),
+      deps.requestDeadlineMs ?? resolveUpstreamTimeoutMs(),
+    );
+    if (set) {
+      set.headers["x-request-id"] = state.requestId;
+      Object.assign(set.headers, GATEWAY_SECURITY_HEADERS);
+    }
+  });
+  return app as unknown as Elysia;
+}
+
+export function createClientIdentityMiddleware(deps: {
+  readonly stateStore: ProxyRequestStateStore;
+  readonly trustedProxyBoundary: TrustedProxyBoundary;
+  readonly resolvePeerAddress?: (request: Request) => string | null;
+}): Elysia {
+  // `beforeHandle`, not `onRequest`: plugin-scoped `onRequest` hooks do not
+  // fire for these routes under Elysia 2 beta (same scoping gap that muted
+  // plugin `afterResponse` before `registerTelemetryLifecycle`), which left
+  // `clientIdentity` unset and every gateway row without a client IP.
+  // `beforeHandle` hooks from `.use()` plugins run in registration order, so
+  // pipeline position still guarantees this executes before IP-abuse checks.
+  return new Elysia()
+    .beforeHandle(({ request, server }) => {
+      const state = deps.stateStore.require(request);
+      // The IP-abuse root hook already resolved the same identity from the
+      // same boundary (and only for /v1/*, exactly these routes); reuse it so
+      // a request pays one resolveClientIdentity instead of two. Fall back to
+      // resolving here when running in a reduced composition without the
+      // abuse guard.
+      if (!state.clientIdentity) {
+        const peer = deps.resolvePeerAddress
+          ? deps.resolvePeerAddress(request)
+          : (server?.requestIP(request)?.address ?? null);
+        if (!peer)
+          throw peerAddressUnavailableError();
+        const address = resolveClientIdentity(request, deps.trustedProxyBoundary, peer);
+        state.clientIdentity = {
+          address,
+          source: address === peer ? "tcp-peer" : "trusted-forwarded-header",
+        };
+      }
+      const address = state.clientIdentity.address;
+      const path = state.ingressPath;
+      if (!isProxyDispatchRoute(path)) return;
+      // The ingress policy stage already decoded the body, so the client's
+      // requested model is readable here — before canonical parsing runs. It is
+      // read defensively and only for display: routing still resolves the model
+      // through the surface adapter, and a body that is not an object simply
+      // yields no model rather than failing the request.
+      const body = state.ingressBody;
+      const requestedModel =
+        body !== null && typeof body === "object" && !Array.isArray(body)
+          ? (body as Record<string, unknown>)["model"]
+          : undefined;
+      const userAgent = request.headers.get("user-agent");
+      pushStructuredConsoleLog("info", "Incoming proxy request", {
+        event: "request_start",
+        requestId: state.requestId,
+        method: request.method,
+        endpoint: path,
+        clientIp: address,
+        ...(typeof requestedModel === "string" && requestedModel.length > 0
+          ? { model: requestedModel }
+          : {}),
+        ...(userAgent === null || userAgent.length === 0
+          ? {}
+          : { userAgent: userAgent.slice(0, 512) }),
+      });
+    })
+    .as("plugin");
+}
+
+export function createCanonicalRequestMiddleware(deps: {
+  readonly stateStore: ProxyRequestStateStore;
+  readonly surfaceRegistry: SurfaceAdapterRegistry;
+  readonly adapters: ReadonlyMap<string, CanonicalAdapter>;
+  /**
+   * Whether this tenant's payload-capture mode keeps request bodies
+   * (`full`). `none`/`metadata` never read the request body at finalize, so
+   * the parsed ingress body can be released as soon as the canonical request
+   * exists instead of being held — across the whole upstream stream. Injected
+   * so this stage does not import the capture policy or the database.
+   */
+  readonly keepsIngressBody: (tenantId: string | null) => Promise<boolean>;
+}): Elysia {
+  return new Elysia()
+    .beforeHandle(async ({ request }) => {
+      // Model discovery and other GET/multimodal routes must not go through canonical parsing.
+      if (skipNonCanonicalProxyRequest(request)) return;
+      const path = fastPathname(request.url);
+      const state = deps.stateStore.require(request);
+      // Single-read invariant: the ingress policy middleware already decoded the
+      // body once into `state.ingressBody`. Never re-read `request.body` here —
+      // it is already consumed/locked. `undefined` means the ingress stage did
+      // not run (reduced composition); fail closed. An explicit `null` (JSON
+      // literal `null` body) is a valid single-read value and flows to the
+      // surface adapter's parse error rather than triggering a second read.
+      if (state.ingressBody === undefined)
+        throw new GatewayError("route_unavailable", 503, "The request body was never read, so this route cannot be served (request {requestId}). Resend the request. The bouncer stepped out — resend shortly 🚪");
+      const body = state.ingressBody;
+      const headers: Record<string, string> = {};
+      request.headers.forEach((value, key) => {
+        headers[key] = value;
+      });
+      const detection = deps.surfaceRegistry.detectOnce({ body, headers, path });
+      if (detection.disagreement) {
+        // A path-vs-body disagreement is expected traffic, not a fault: a
+        // standard chat body ({model, messages[], max_tokens}) also matches
+        // the messages body shape, so nearly every chat request with
+        // max_tokens "disagrees". Warn only when the explicit header is
+        // involved — a marker contradicting the path means the client is
+        // genuinely confused about which surface it wants.
+        const markerInvolved = detection.signals.some((s) => s.source === "explicit_marker");
+        if (markerInvolved) {
+          log.warn("[surface] conflicting signals detected for surface routing", {
+            resolved: detection.surface,
+            winning_source: detection.winning_source,
+            signals: detection.signals,
+          });
+        } else {
+          log.debug("[surface] ambiguous body shape resolved by endpoint path", {
+            resolved: detection.surface,
+            signals: detection.signals,
+          });
+        }
+      }
+      const adapter = deps.adapters.get(detection.surface);
+      if (!adapter)
+        throw new GatewayError(
+          "capability_unsupported",
+          400,
+          `Surface adapter unavailable: ${detection.surface} (request {requestId}). Know your tools — this one just isn't in the box 🧰`,
+          { surface: detection.surface },
+        );
+      const ingress = deps.stateStore.require(request);
+      const userAgent = headers["user-agent"];
+      if (userAgent) ingress.clientUserAgent = userAgent.slice(0, 512);
+      const parsed = adapter.parse({ body, headers, path });
+      // The dashboard's diagnostic model test opts out of tenant system-prompt
+      // injection: it carries its own purpose-built prompt (see
+      // gateway-model-test.ts). Honored for any client that sends the marker —
+      // the same trust model as the surface header.
+      if (headers[SKIP_TENANT_SYSTEM_PROMPT_HEADER] === "1") {
+        parsed.skipTenantSystemPrompt = true;
+      }
+      ingress.canonicalRequest = parsed;
+      // The parsed body is the largest per-request value, and once the
+      // canonical request exists the only later reader is payload capture — and
+      // only in `full` mode (see `captureTerminalPayload`). For `none`/`metadata`
+      // drop the reference now: held until cleanup, it would otherwise stay
+      // resident for the entire upstream stream.
+      if (!(await deps.keepsIngressBody(ingress.authorization?.tenantId ?? null))) {
+        ingress.releaseIngressBody();
+      }
+    })
+    .as("plugin");
+}
+
+export function createProxyRoutePreparationMiddleware(deps: {
+  readonly stateStore: ProxyRequestStateStore;
+  readonly preparer: ProxyRequestPreparer;
+}): Elysia {
+  return new Elysia()
+    .beforeHandle(async ({ request }) => {
+      if (skipNonCanonicalProxyRequest(request)) return;
+      const state = deps.stateStore.require(request);
+      if (!state.authorization || !state.canonicalRequest)
+        throw new GatewayError("route_unavailable", 503, "The request was not authenticated and parsed, so this route cannot be served (request {requestId}). Resend the request. The bouncer stepped out — resend shortly 🚪");
+      // The key rides along so a strike is charged to the caller that made it.
+      // Without it, one recipient of a shared link could escalate a ban onto
+      state.preparedRequest = await deps.preparer.prepare({
+        canonicalRequest: state.canonicalRequest,
+        authorization: state.authorization,
+        deadlineMs: state.deadlineMs,
+        signal: state.abortController.signal,
+        ...(state.clientUserAgent === undefined
+          ? {}
+          : { clientUserAgent: state.clientUserAgent }),
+      });
+    })
+    .as("plugin");
+}

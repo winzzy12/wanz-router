@@ -1,0 +1,89 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Node.js and package management
+node_modules
+npm-debug.log
+yarn-error.log
+.pnp
+.pnp.js
+
+# Build and distribution
+/build
+/dist
+scripts/*.test.ts
+
+# Local dev artifacts. `bin` holds vendored platform-specific proxy binaries for
+# local development; the image ships none, so the entry only keeps them out of
+# the build context. `.cache` holds generated runtime configs.
+bin
+vendor
+.cache
+
+# Development tools and IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Agent working state: `.claude/worktrees/` holds full repository copies, so
+# excluding it keeps the build context from ballooning while an agent runs.
+.claude
+# Environment files and secrets
+.env*
+!.env.example
+*.pem
+*.key
+*.crt
+*.pfx
+*.dump
+*.sql
+backups
+!migrations/
+!migrations/**
+# Testing
+coverage
+.nyc_output
+*.lcov
+# Tests live under the root test tree; source is production-only.
+test
+# Documentation
+README.md
+LICENSE
+CHANGELOG.md
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.circleci
+.travis.yml
+
+# Project-specific
+docker-compose*.yml
+
+# Build context size is the first thing that decides how fast `docker build`
+# starts: the daemon hashes and uploads everything not excluded here before a
+# single layer runs. These are the largest trees that are never read by the
+# Dockerfile.
+documentation
+docs
+*.md
+!README.md
+# Local agent/editor state and OS noise, which can be very large.
+.omp
+.serena
+.kilocode
+.worktrees
+Thumbs.db
+ehthumbs.db
+desktop.ini
+# Local database and log files: never shipped, and a stray lite db can be huge.
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.tsbuildinfo

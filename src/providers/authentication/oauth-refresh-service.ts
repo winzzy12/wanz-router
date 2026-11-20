@@ -1,0 +1,766 @@
+/**
+ * OAuth token refresh orchestration: in-process single-flight plus a
+ * Postgres lease-fenced compare-and-swap.
+ *
+ * Two layers of coordination:
+ *  1. In-process: a `Map<accountId, Promise>` so concurrent callers in the
+ *     same process share one upstream refresh call instead of racing.
+ *  2. Cross-process: a lease (`provider_oauth_states.lease_owner`/
+ *     `lease_expires_at`) acquired via a conditional `UPDATE`, and every
+ *     persisted mutation is fenced on `lease_owner = <this process's lease
+ *     id>` so a process whose lease expired mid-refresh cannot clobber a
+ *     peer that took over — its fenced write simply matches zero rows.
+ *
+ * Refresh token, expiry, and lease live in `provider_oauth_states`
+ * (), a 1:0/1 table keyed by `provider_account_id` — split out
+ * of `provider_accounts` because the lease is a sparse, cross-process
+ * coordination concern that stayed null on every non-OAuth (`api_key`)
+ * account row. Credential ciphertext and health-machine fields stay on
+ * `provider_accounts`; `persistRefreshed`/`disableAccount` update both
+ * tables inside one transaction, fenced first on the lease table so a
+ * losing process's write touches zero rows in either table.
+ */
+import { randomUUID } from "node:crypto";
+import { and, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import { sleep } from "../../shared/sleep";
+import { providerAccounts, providerOauthStates } from "../../persistence/schema";
+import { decryptCredentialToString, encryptCredential } from "../../security/crypto";
+import { invalidateCredentialCache, loadAccountWithOauthState } from "../operations/provider-credential-service";
+import { applyAccountVerdict } from "../operations/account-health-service";
+import { resolveAccountDisabledRecoveryMs } from "../../config/cooldowns";
+import { asJsonbRecord } from "../../shared/coerce";
+import {
+  loadAccountWithFreshness,
+  type AccountWithFreshnessRow,
+} from "../operations/provider-credential-service";
+import { refreshLeadMs } from "../operations/oauth-refresh-lead";
+import { classifyAccessTokenUsability } from "./static-token-detection";
+import type { OAuthAccountIdentity } from "./oauth-flow-store";
+import { pushStructuredConsoleLog } from "../../observability/log-ring";
+
+/**
+ * Classifies an OAuth token-refresh failure as definitive (the credential is
+ * permanently revoked/expired and must stop being retried) or transient
+ * (network blip, upstream 5xx/429, temporary outage — safe to retry later).
+ *
+ * Uses a regex over the error's message/body, not a bare HTTP-status
+ * allowlist, since the same status code (401) can mean either "token is
+ * dead" or "clock skew, try again" depending on the error body's actual
+ * wording.
+ */
+
+const DEFINITIVE_PATTERN =
+  /invalid_grant|invalid_token|unauthorized_client|revoked|refresh_token.*expired|github_copilot_profile_mismatch/i;
+
+interface OAuthRefreshFailure {
+  readonly status?: number | undefined;
+  readonly message: string;
+}
+
+type OAuthFailureClassification = "definitive" | "transient";
+
+/**
+ * A bare 401 with no body match for the definitive pattern is still treated
+ * as definitive (an unrecognized-but-clearly-"unauthorized" response from a
+ * refresh endpoint almost never self-heals); everything else — timeouts,
+ * 5xx, 429, 403/"forbidden", "temporarily unavailable" — is transient.
+ */
+export function classifyOAuthRefreshFailure(
+  failure: OAuthRefreshFailure,
+): OAuthFailureClassification {
+  if (DEFINITIVE_PATTERN.test(failure.message)) return "definitive";
+  if (failure.status === 401) return "definitive";
+  return "transient";
+}
+
+/** How long a lease is valid for before another process may reclaim it. */
+const LEASE_TTL_MS = 15_000;
+
+/**
+ * Bound on a single token-endpoint call. Neither the reactive path nor the
+ * sweep passes a caller signal, and a hung endpoint must not block either
+ * indefinitely — timeouts classify as transient failures.
+ */
+const REFRESH_HTTP_TIMEOUT_MS = 30_000;
+
+export interface OAuthTokenRefreshResult extends OAuthAccountIdentity {
+  readonly access: string;
+  /** Omitted when the provider keeps the existing refresh token valid. */
+  readonly refresh?: string;
+  readonly expiresAt: Date;
+  /**
+   * Auth configuration the refresh corrected or discovered — most often the
+   * upstream profile the account resolves to, which some providers only report
+   * beside a fresh access token. Omitted means the stored state stands.
+   */
+  readonly auth_state?: Readonly<Record<string, unknown>>;
+  /**
+   * Display identity the refresh learned (email/username from the fresh token
+   * or token response). Omitted when the provider reports nothing new.
+   */
+  readonly accountLabel?: string;
+}
+
+/**
+ * What a refresher is told about the account it is refreshing.
+ *
+ * A refresh is not authorized by the refresh token alone everywhere: one flow
+ * replays the client credentials its login registered, another posts to a
+ * per-account token endpoint. Both belong to the account rather than to the
+ * token, so they are handed in here instead of being re-read from storage
+ * inside every provider client.
+ */
+export interface OAuthRefreshContext {
+  readonly account_id: string;
+  readonly auth_state?: Readonly<Record<string, unknown>>;
+  /** Current access token for endpoints that authenticate refresh requests with both tokens. */
+  readonly access_token?: string;
+  /** Decrypted companion secret for flows whose login registered a client secret. */
+  readonly client_secret?: string;
+}
+
+/** Provider-specific token-endpoint client. Implemented per provider in later phases. */
+export interface OAuthTokenRefresher {
+  /** Requests the current access token in refresh context only when required by the endpoint. */
+  readonly requiresAccessToken?: boolean;
+  refresh(
+    refreshToken: string,
+    signal?: AbortSignal,
+    context?: OAuthRefreshContext,
+  ): Promise<OAuthTokenRefreshResult>;
+}
+
+type AccountRow = AccountWithFreshnessRow;
+
+/** Acquires the refresh lease for `accountId`, or returns false if another live lease holds it. */
+async function acquireLease(
+  db: CartethyiaDatabase,
+  accountId: string,
+  owner: string,
+): Promise<boolean> {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + LEASE_TTL_MS);
+  const result = await db
+    .update(providerOauthStates)
+    .set({ leaseOwner: owner, leaseExpiresAt: expiresAt })
+    .where(
+      and(
+        eq(providerOauthStates.providerAccountId, accountId),
+        or(isNull(providerOauthStates.leaseOwner), lt(providerOauthStates.leaseExpiresAt, now)),
+      ),
+    )
+    .returning({ id: providerOauthStates.providerAccountId });
+  return result.length > 0;
+}
+
+/** Releases the lease without mutating credential state (used for transient failures). */
+async function releaseLease(
+  db: CartethyiaDatabase,
+  accountId: string,
+  owner: string,
+): Promise<void> {
+  await db
+    .update(providerOauthStates)
+    .set({ leaseOwner: null, leaseExpiresAt: null })
+    .where(
+      and(
+        eq(providerOauthStates.providerAccountId, accountId),
+        eq(providerOauthStates.leaseOwner, owner),
+      ),
+    );
+}
+
+/**
+ * D21 invariant guard: a refresh is not a health verdict, so mutating the
+ * account's `status` here would silently re-enable an account a refresh was
+ * never meant to resurrect. The `.set()` calls in `persistRefreshed` accept
+ * `status` at the type level (it is a column on `provider_accounts`), so the
+ * guard is a runtime assertion that fails loudly in development instead of
+ * letting a future edit change health state from the refresh path.
+ */
+function assertRefreshNeverMutatesStatus(set: Record<string, unknown>): void {
+  if ("status" in set) {
+    throw new Error(
+      "persistRefreshed must never write `status`; a refresh is not a health verdict",
+    );
+  }
+}
+
+/** Persists a successful refresh and releases the lease, fenced on still holding it. */
+async function persistRefreshed(
+  db: CartethyiaDatabase,
+  accountId: string,
+  owner: string,
+  result: OAuthTokenRefreshResult,
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    // This function must never write `status`; a refresh is not a health
+    // verdict. The guard below makes an accidental status write a loud dev
+    // failure rather than a silent re-enable.
+    const oauthSet = {
+      ...(result.refresh === undefined
+        ? {}
+        : { refreshCiphertext: encryptCredential(result.refresh) }),
+      expiresAt: result.expiresAt,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    };
+    assertRefreshNeverMutatesStatus(oauthSet);
+    const leaseRows = await tx
+      .update(providerOauthStates)
+      .set(oauthSet)
+      .where(
+        and(
+          eq(providerOauthStates.providerAccountId, accountId),
+          eq(providerOauthStates.leaseOwner, owner),
+        ),
+      )
+      .returning({ id: providerOauthStates.providerAccountId });
+    if (leaseRows.length === 0) return false;
+    const learnedLabel = result.accountLabel ?? result.accountEmail ?? result.accountName;
+    const accountSet = {
+      credentialCiphertext: encryptCredential(result.access),
+      // Only what the refresh reported: a refresher that learned nothing new
+      // leaves the stored configuration alone rather than blanking it.
+      // A learned identity only replaces a default label � an operator's
+      // custom rename is never overwritten. The CASE keeps the read and the
+      // write in one statement, so a concurrent rename cannot lose to the
+      // refresh's learned identity.
+      ...(learnedLabel === undefined
+        ? {}
+        : {
+          label: sql`CASE WHEN lower(trim(${providerAccounts.label})) = lower(trim(${providerAccounts.providerId})) OR lower(trim(${providerAccounts.label})) = lower(trim(${learnedLabel})) THEN ${learnedLabel} ELSE ${providerAccounts.label} END`,
+        }),
+      ...(result.auth_state === undefined && result.accountName === undefined
+        ? {}
+        : {
+          authState: {
+            ...(result.auth_state ?? {}),
+            ...(result.accountName === undefined ? {} : { accountName: result.accountName }),
+          },
+        }),
+      ...(result.accountEmail === undefined ? {} : { accountEmail: result.accountEmail }),
+      ...(result.accountEmail !== undefined || result.accountName !== undefined
+        ? { identityCheckedAt: new Date() }
+        : {}),
+    };
+    // The second half of the D21 invariant: the credential write must never
+    // touch the account's health state either.
+    assertRefreshNeverMutatesStatus(accountSet);
+    await tx
+      .update(providerAccounts)
+      .set(accountSet)
+      .where(eq(providerAccounts.id, accountId));
+    invalidateCredentialCache(accountId);
+    return true;
+  });
+}
+
+/**
+ * Packages the account-side facts a refresh needs but the refresh token does
+ * not carry. The companion secret is decrypted here, once, so provider clients
+ * never reach into the database.
+ */
+function buildRefreshContext(row: AccountRow, includeAccessToken: boolean): OAuthRefreshContext {
+  const authState = asJsonbRecord(row.authState);
+  return {
+    account_id: row.id,
+    ...(authState === undefined ? {} : { auth_state: authState }),
+    ...(includeAccessToken && row.credentialCiphertext
+      ? { access_token: decryptCredentialToString(row.credentialCiphertext) }
+      : {}),
+    ...(row.clientSecretCiphertext
+      ? { client_secret: decryptCredentialToString(row.clientSecretCiphertext) }
+      : {}),
+  };
+}
+
+/**
+ * Marks an account permanently unusable after a definitive refresh failure,
+ * fenced on the lease.
+ *
+ * @param preserveOperatorDisable When true, an account that is already
+ *   `disabled` with no `cooldownUntil` — the operator's own disable — keeps its
+ *   lack of a recovery deadline (D23). A machine disable (this function being
+ *   the machine) always writes a deadline for itself, but it must not convert
+ *   an operator's terminal decision into a recoverable one: adding a deadline
+ *   to an operator-disabled row is what made the Recover button appear on an
+ *   account the operator disabled on purpose.
+ */
+async function disableAccount(
+  db: CartethyiaDatabase,
+  accountId: string,
+  owner: string,
+  message: string,
+  options: { readonly preserveOperatorDisable?: boolean } = {},
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    const leaseRows = await tx
+      .update(providerOauthStates)
+      .set({ leaseOwner: null, leaseExpiresAt: null })
+      .where(
+        and(
+          eq(providerOauthStates.providerAccountId, accountId),
+          eq(providerOauthStates.leaseOwner, owner),
+        ),
+      )
+      .returning({ id: providerOauthStates.providerAccountId });
+    if (leaseRows.length === 0) return;
+    const disabledRecoveryMs = resolveAccountDisabledRecoveryMs();
+    // Converge on the health application seam (proposal §3.5): a definitive
+    // OAuth refresh failure is a producer into `applyAccountVerdict`, not a
+    // separate state machine. The seam preserves D23 (operator-disable rows
+    // keep their `null` recovery deadline) via `preserveOperatorDisable`.
+    const applied = await applyAccountVerdict(tx, {
+      accountId,
+      // A timed cooldown, never a permanent disable: the account comes back
+      // once the recovery window elapses, so one definitive rejection can
+      // never park the credential for good. The deadline is also what
+      // distinguishes this (machine verdict) from an operator's own disable,
+      // which leaves `cooldownUntil` null and is therefore never swept (D23).
+      status: "cooldown",
+      // `auth_invalidated` is the category the console reads to render the
+      // "Re-login required" pill, and the one the quota sweep excludes so it
+      // stops re-probing a credential that cannot repair itself. The refresh
+      // grant was definitively rejected and the stored access token could not
+      // be shown to still work, so this is exactly that state.
+      reason: message,
+      category: "auth_invalidated",
+      cooldownUntil:
+        disabledRecoveryMs > 0 ? new Date(Date.now() + disabledRecoveryMs) : null,
+      ...(options.preserveOperatorDisable === true
+        ? { preserveOperatorDisable: true }
+        : {}),
+    });
+    if (applied) invalidateCredentialCache(accountId);
+  });
+}
+
+/**
+ * Marks an account as carrying a static bearer token: used exactly as issued,
+ * never refreshed. Called when the refresh path finds no refresh token on
+ * record, so the account converges to the same state the console's explicit
+ * "static token" toggle sets — the sweep skips it and its status stops reading
+ * as a broken/re-auth account. Not lease-fenced: a non-destructive annotation
+ * that any process may write, and the credential is not touched.
+ *
+ * This never changes `status`: a `disabled` account stays `disabled` (only an
+ * operator or an explicit recovery may re-enable it), while an `active` one
+ * stays `active`. The static marker and the error clearing are orthogonal to
+ * the account's health state.
+ *
+ * D24: for a `disabled` row the error fields are deliberately kept. Once the
+ * account is parked, `lastErrorCategory` is the only record of *why* (e.g.
+ * `auth_invalidated` → "Re-login required"); wiping it on the static
+ * annotation would leave a disabled account with no diagnosable reason. An
+ * `active` row still clears them — there the error is stale by definition.
+ */
+async function markStaticToken(db: CartethyiaDatabase, accountId: string): Promise<void> {
+  const rows = await db
+    .select({ status: providerAccounts.status })
+    .from(providerAccounts)
+    .where(eq(providerAccounts.id, accountId))
+    .limit(1);
+  const isDisabled = rows[0]?.status === "disabled";
+  await db
+    .update(providerAccounts)
+    .set({
+      staticToken: true,
+      cooldownUntil: null,
+      // A static token is a normal, usable credential, not an error state: any
+      // error left by the failed refresh would otherwise keep the row reading
+      // "Re-login required" while it is in fact serving. Mirrors the console's
+      // static-token toggle. For a `disabled` row the category is preserved
+      // (D24), because there it is the diagnosis, not a stale artifact.
+      ...(isDisabled
+        ? {}
+        : { lastError: null, lastErrorCategory: null, lastErrorAt: null }),
+    })
+    .where(eq(providerAccounts.id, accountId));
+}
+
+function failureMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+/**
+ * Decrypts a stored credential, returning `undefined` when the ciphertext
+ * cannot be decrypted. A corrupt row is not evidence about token expiry, so the
+ * caller treats it the same as a missing token rather than throwing inside the
+ * refresh failure path.
+ */
+function safeDecryptCredential(ciphertext: Buffer): string | undefined {
+  try {
+    return decryptCredentialToString(ciphertext);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Best-effort HTTP status extraction from an OAuth refresh error. Most
+ *  providers surface `error.status` or embed the status in the message; we
+ *  accept either so the classifier can honor "bare 401 -> definitive". */
+function failureStatus(error: unknown): number | undefined {
+  if (error !== null && typeof error === "object" && "status" in error) {
+    const raw = error.status;
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  }
+  const msg = failureMessage(error);
+  const match = /\b(\d{3})\b/.exec(msg);
+  if (match) {
+    const status = Number(match[1]);
+    if (status >= 400 && status < 600) return status;
+  }
+  return undefined;
+}
+
+/**
+ * Boot-time convergence for OAuth accounts already parked by an earlier
+ * refresh failure.
+ *
+ * Before automatic detection existed, a definitive refresh failure disabled the
+ * account outright (`oauth_revoked`) even when the stored access token was
+ * still perfectly usable. This pass re-reads those rows once at startup and
+ * moves each to where it now belongs:
+ *
+ *  - access token still usable ⇒ static token; the account stays `disabled`;
+ *    only an operator can re-enable it;
+ *  - otherwise ⇒ the `auth_invalidated` category the console renders as
+ *    "Re-login required" and the quota sweep excludes.
+ *
+ * Idempotent and cheap: it only inspects OAuth rows that are `disabled` with a
+ * credential-failure category, so a healthy deployment scans nothing. The
+ * credential is decoded, never verified — the same structural-only trust the
+ * dispatch path already places in the stored token.
+ */
+export async function reconcileStaticTokenAccounts(db: CartethyiaDatabase): Promise<number> {
+  const candidates = await db
+    .select({
+      id: providerAccounts.id,
+      credentialCiphertext: providerAccounts.credentialCiphertext,
+      staticToken: providerAccounts.staticToken,
+    })
+    .from(providerAccounts)
+    .where(
+      and(
+        eq(providerAccounts.credentialKind, "oauth"),
+        eq(providerAccounts.status, "disabled"),
+        or(
+          eq(providerAccounts.lastErrorCategory, "oauth_revoked"),
+          eq(providerAccounts.lastErrorCategory, "auth_invalidated"),
+        ),
+      ),
+    );
+  let changed = 0;
+  for (const row of candidates) {
+    if (row.staticToken) continue;
+    const usability = classifyAccessTokenUsability(
+      row.credentialCiphertext ? safeDecryptCredential(row.credentialCiphertext) : undefined,
+    );
+    if (usability === "usable") {
+      await markStaticToken(db, row.id);
+      invalidateCredentialCache(row.id);
+      pushStructuredConsoleLog("info", "OAuth account recovered as a static token at boot", {
+        event: "token_refresh",
+        accountId: row.id,
+        errorCode: "static_token",
+      });
+      changed += 1;
+      continue;
+    }
+    // Converge the legacy category name so the console and the quota sweep see
+    // one spelling of "credential rejected, operator must re-login".
+    await db
+      .update(providerAccounts)
+      .set({ lastErrorCategory: "auth_invalidated" })
+      .where(eq(providerAccounts.id, row.id));
+    changed += 1;
+  }
+  return changed;
+}
+
+/**
+ * Rows whose OAuth token is due for proactive refresh (used by the sweep worker).
+ *
+ * The due test is applied in JS, not as one SQL `expires_at < cutoff`, because
+ * the lead is per provider (`refreshLeadMs`): Claude re-mints ~4h ahead, Codex
+ * ~5 days, Antigravity ~5 min, and a single global cutoff cannot express that.
+ * Accounts with no recorded expiry are always due — an account the sweep cannot
+ * see is one whose token dies silently, which is the failure this guards.
+ */
+/**
+ * Rows one due-scan reads. The expiry test runs in JS because the lead is per
+ * provider, so the bound has to sit on the query itself.
+ */
+const OAUTH_DUE_SCAN_LIMIT = 2_000;
+
+export async function loadDueOAuthAccounts(
+  db: CartethyiaDatabase,
+  skewMs?: number,
+): Promise<readonly { readonly id: string; readonly providerId: string }[]> {
+  const rows = await db
+    .select({
+      id: providerAccounts.id,
+      providerId: providerAccounts.providerId,
+      expiresAt: providerOauthStates.expiresAt,
+      staticToken: providerAccounts.staticToken,
+    })
+    .from(providerAccounts)
+    .innerJoin(providerOauthStates, eq(providerOauthStates.providerAccountId, providerAccounts.id))
+    .where(
+      and(
+        eq(providerAccounts.credentialKind, "oauth"),
+        // `cooldown` is included: a cooling account's token still expires, and
+        // a refresh that lands while it is parked is what lets it serve the
+        // moment the cooldown ends. `disabled` stays out — that is an
+        // operator decision, and refreshing it would spend a grant on an
+        // account that must not return to rotation on its own.
+        inArray(providerAccounts.status, ["active", "cooldown"]),
+      ),
+    )
+    // The due test is applied in JS, so this limit bounds the scan, not the
+    // result. One pass cannot read the whole table; accounts past the limit
+    // are reached on a later tick once the ones in front have been refreshed
+    // and dropped out of the window.
+    .limit(OAUTH_DUE_SCAN_LIMIT);
+  const now = Date.now();
+  return rows
+    .filter((row) => {
+      // A static token is used exactly as issued: there is no refresh grant to
+      // run, so the sweep must not touch it. Refreshing it every pass only
+      // floods the log with a guaranteed no-op. The operator clears the flag
+      // when the account has a real refresh token again.
+      if (row.staticToken) return false;
+      if (row.expiresAt == null) return true;
+      const lead = skewMs ?? refreshLeadMs(row.providerId);
+      return row.expiresAt.getTime() - lead <= now;
+    })
+    .map((row) => ({ id: row.id, providerId: row.providerId }));
+}
+
+export class OAuthRefreshService {
+  /** Bound on concurrently tracked single-flight refreshes; keys are account ids, so the real bound is the account count. */
+  private static readonly MAX_INFLIGHT = 1_000;
+
+  readonly #db: CartethyiaDatabase;
+  readonly #inFlight = new Map<string, Promise<string | null>>();
+
+  constructor(db: CartethyiaDatabase) {
+    this.#db = db;
+  }
+
+  /**
+   * Ensures a fresh access token for an OAuth account, refreshing it first
+   * if it's within `opts.skewMs` of expiry (or already expired). When
+   * `opts.force` is `true`, the freshness check is bypassed and the
+   * refresher is always invoked — used by the 401 dispatch retry so a peer
+   * that just refreshed cannot cause the caller to reuse a dead cached
+   * secret. Returns the current decrypted access token, or `null` when the
+   * account isn't OAuth, has no stored refresh token, or refresh failed.
+   *
+   * `opts.origin` labels who asked for the refresh (`ui`/`sweep`/`dispatch`)
+   * and is carried on the `token_refresh` log lines (D26). The origin is
+   * observational only — it never changes what a refresh does.
+   */
+  async ensureFreshAccessToken(
+    accountId: string,
+    refresher: OAuthTokenRefresher,
+    opts: { force?: boolean; skewMs?: number; origin?: "ui" | "sweep" | "dispatch" } = {},
+  ): Promise<string | null> {
+    const force = opts.force === true;
+    // No explicit skew: the per-provider lead is applied at load time.
+    const skewMs = opts.skewMs;
+    const origin = opts.origin ?? "sweep";
+    // Forced refreshes get their own in-flight slot so they don't merge with
+    // a raced non-force call that would otherwise short-circuit.
+    const key = force ? `${accountId}:force` : accountId;
+    const existing = this.#inFlight.get(key);
+    if (existing) return existing;
+    // Eviction guard: keys are account ids (bounded by the accounts table),
+    // but a runaway caller could still fan out unique keys; drop the oldest
+    // in-flight task rather than grow without bound. An evicted task's
+    // `.finally` delete is a no-op for a key no longer present, and a racing
+    // duplicate refresh is fenced cross-process by the lease below.
+    if (this.#inFlight.size >= OAuthRefreshService.MAX_INFLIGHT) {
+      const oldestKey = this.#inFlight.keys().next().value;
+      if (oldestKey !== undefined) this.#inFlight.delete(oldestKey);
+    }
+    const task = this.#refreshIfDue(accountId, refresher, skewMs, force, origin).finally(() => {
+      this.#inFlight.delete(key);
+    });
+    this.#inFlight.set(key, task);
+    return task;
+  }
+
+  async #refreshIfDue(
+    accountId: string,
+    refresher: OAuthTokenRefresher,
+    skewMs: number | undefined,
+    force: boolean,
+    origin: "ui" | "sweep" | "dispatch",
+  ): Promise<string | null> {
+    const account = await loadAccountWithFreshness(this.#db, accountId, skewMs);
+    if (!account || account.row.credentialKind !== "oauth") return null;
+    const health = await loadAccountWithOauthState(this.#db, accountId, {
+      includeStatus: true,
+      includeLastErrorCategory: true,
+    });
+    if (health?.status === "disabled" && health.lastErrorCategory === "auth_invalidated") {
+      pushStructuredConsoleLog("info", "OAuth token refresh skipped: account auth invalidated", {
+        event: "token_refresh",
+        accountId,
+        providerId: account.row.providerId,
+        errorCode: "auth_invalidated",
+        details: { origin },
+      });
+      return null;
+    }
+    const { row, dueAt } = account;
+    // A static token is used exactly as issued and never refreshed. There is
+    // nothing to re-mint, so return null — the same "cannot refresh" signal a
+    // missing refresh token gives — rather than re-issuing the identical
+    // credential to a forced (401) retry, which would only repeat the same
+    // request against the same upstream. Dispatch still uses the stored token
+    // directly (`dueAt` is undefined for a static token, so the caller's
+    // refresh branch is skipped and the decrypted credential is used as-is).
+    if (row.staticToken) return null;
+    if (!force && dueAt !== undefined && dueAt > Date.now()) {
+      return row.credentialCiphertext
+        ? decryptCredentialToString(row.credentialCiphertext)
+        : null;
+    }
+    return this.#refreshNow(row, refresher, skewMs, origin);
+  }
+
+  async #refreshNow(
+    row: AccountRow,
+    refresher: OAuthTokenRefresher,
+    skewMs: number | undefined,
+    origin: "ui" | "sweep" | "dispatch",
+  ): Promise<string | null> {
+    // D26: statusBefore is read once up front (the row projection used by the
+    // refresh path does not carry status) and statusAfter is re-read after any
+    // mutation, so the log proves a refresh never flipped the account.
+    const statusBefore = await readAccountStatus(this.#db, row.id);
+    pushStructuredConsoleLog("info", "OAuth token refresh started", {
+      event: "token_refresh",
+      accountId: row.id,
+      providerId: row.providerId,
+      details: { origin, statusBefore },
+    });
+    const owner = randomUUID();
+    const leased = await acquireLease(this.#db, row.id, owner);
+    if (!leased) {
+      // A peer holds the lease — briefly wait for it to finish, then read whatever it left.
+      await sleep(500);
+      const fresh = await loadAccountWithFreshness(this.#db, row.id, skewMs);
+      return fresh?.row.credentialCiphertext && fresh.dueAt !== undefined && fresh.dueAt > Date.now()
+        ? decryptCredentialToString(fresh.row.credentialCiphertext)
+        : null;
+    }
+    if (!row.refreshCiphertext) {
+      await releaseLease(this.#db, row.id, owner);
+      // No refresh token on record: the access token is used exactly as issued
+      // and cannot be re-minted, so every future refresh attempt is a
+      // guaranteed no-op. Mark the account static — the same state the
+      // console's toggle sets — so the sweep stops retrying it and the status
+      // reads as an informational static token rather than a broken account.
+      await markStaticToken(this.#db, row.id);
+      pushStructuredConsoleLog("info", "OAuth token refresh skipped: static token", {
+        event: "token_refresh",
+        accountId: row.id,
+        providerId: row.providerId,
+        errorCode: "static_token",
+        details: { origin },
+      });
+      return null;
+    }
+    const refreshToken = decryptCredentialToString(row.refreshCiphertext);
+    try {
+      const result = await refresher.refresh(
+        refreshToken,
+        AbortSignal.timeout(REFRESH_HTTP_TIMEOUT_MS),
+        buildRefreshContext(row, refresher.requiresAccessToken === true),
+      );
+      const persisted = await persistRefreshed(this.#db, row.id, owner, result);
+      // D26: `statusAfter` is re-read from the DB rather than assumed — a
+      // successful refresh never changes `status`, and the log proves it.
+      const statusAfter = await readAccountStatus(this.#db, row.id);
+      pushStructuredConsoleLog(persisted ? "info" : "warn", persisted ? "OAuth token refresh completed" : "OAuth token refresh lost lease", {
+        event: "token_refresh",
+        accountId: row.id,
+        providerId: row.providerId,
+        ...(persisted ? {} : { errorCode: "refresh_lease_lost" }),
+        details: {
+          expiresAt: result.expiresAt.toISOString(),
+          origin,
+          statusBefore,
+          statusAfter,
+        },
+      });
+      return persisted ? result.access : null;
+    } catch (error) {
+      const classification = classifyOAuthRefreshFailure({
+        message: failureMessage(error),
+        status: failureStatus(error),
+      });
+      pushStructuredConsoleLog("error", "OAuth token refresh failed", {
+        event: "token_refresh",
+        accountId: row.id,
+        providerId: row.providerId,
+        errorCode: classification,
+        details: { origin, statusBefore },
+      });
+      if (classification === "definitive") {
+        // A definitive refresh failure means the refresh grant is dead — but
+        // the access token already on the row may still be usable as issued.
+        // That is exactly the static-token case: stop refreshing, keep serving.
+        // Only when the token cannot be shown to work (expired or opaque) does
+        // the account need the operator, and it is parked for re-auth.
+        const accessUsability = classifyAccessTokenUsability(
+          row.credentialCiphertext
+            ? safeDecryptCredential(row.credentialCiphertext)
+            : undefined,
+        );
+        if (accessUsability === "usable") {
+          await releaseLease(this.#db, row.id, owner);
+          await markStaticToken(this.#db, row.id);
+          const statusAfter = await readAccountStatus(this.#db, row.id);
+          pushStructuredConsoleLog("info", "OAuth refresh failed; access token still valid, marking static", {
+            event: "token_refresh",
+            accountId: row.id,
+            providerId: row.providerId,
+            errorCode: "static_token",
+            details: { origin, statusBefore, statusAfter },
+          });
+        } else {
+          await disableAccount(this.#db, row.id, owner, failureMessage(error), {
+            // D23: a definitive refresh failure must not turn an operator's
+            // disable into a machine-recoverable one. If the row is already
+            // `disabled` without a deadline, leave it that way.
+            preserveOperatorDisable: true,
+          });
+          const statusAfter = await readAccountStatus(this.#db, row.id);
+          pushStructuredConsoleLog("warn", "OAuth refresh failed definitively; account disabled for re-auth", {
+            event: "token_refresh",
+            accountId: row.id,
+            providerId: row.providerId,
+            errorCode: classification,
+            details: { origin, statusBefore, statusAfter },
+          });
+        }
+      } else {
+        await releaseLease(this.#db, row.id, owner);
+      }
+      return null;
+    }
+  }
+}
+
+/** Reads one account's status (used only for logging/observability, D26). */
+async function readAccountStatus(db: CartethyiaDatabase, accountId: string): Promise<string | undefined> {
+  const loaded = await loadAccountWithOauthState(db, accountId, { includeStatus: true });
+  return loaded?.status;
+}

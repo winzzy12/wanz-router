@@ -1,0 +1,208 @@
+import type {} from "../contracts";
+import { ensureV1Suffix, homeDir, readJsonFile, readTextFile, removeFile, textGet, textHas, textRemove, textUpsert, writeJsonFileWithBackup, writeTextFileWithBackup } from "../fs-ops";
+import type { InjectorSpec } from "../contracts";
+import { ConsoleDomainError } from "../../shared/errors";
+
+
+// Codex injector spec.
+const CODEX_PROVIDER = "cartethyia";
+
+/**
+ * Guards a value before it is interpolated into a quoted TOML string.
+ *
+ * `config.toml` is edited as text, so a `"` or a line break in a model name or
+ * endpoint would close the quoted value and let the remainder be read as TOML
+ * syntax — corrupting (or injecting into) a file the operator hand-edited.
+ * Real identifiers and URLs never carry these characters, so they are rejected
+ * outright rather than escaped.
+ */
+function assertTomlSafeValue(field: string, value: string): void {
+  if (/["\\\n\r]/.test(value)) {
+    throw new ConsoleDomainError(
+      "invalid_request",
+      400,
+      `${field} must not contain quotes, backslashes, or line breaks: it is written to config.toml as a quoted string`,
+    );
+  }
+}
+const CODEX_AUTH_HELPER_NAME = "cartethyia-auth.cjs";
+const CODEX_AUTH_HELPER_SOURCE = [
+  "const fs = require('node:fs');",
+  "const path = require('node:path');",
+  "const auth = JSON.parse(fs.readFileSync(path.join(__dirname, 'auth.json'), 'utf8'));",
+  "const key = auth.cartethyia;",
+  "if (typeof key === 'string') process.stdout.write(key);",
+  "",
+].join("\n");
+
+const codexAuthPath = () => `${homeDir()}/.codex/auth.json`;
+const codexAuthHelperPath = () => `${homeDir()}/.codex/${CODEX_AUTH_HELPER_NAME}`;
+const codexAuthHelperConfigPath = () => codexAuthHelperPath().replaceAll("\\", "/");
+
+export const codexSpec: InjectorSpec = {
+  toolId: "codex",
+  displayName: "Codex CLI",
+  binary: "codex",
+  keepSettingsPathOnMissing: true,
+  resetEvenIfMissing: true,
+  resolvePath: () => `${homeDir()}/.codex/config.toml`,
+  resolveDir: () => `${homeDir()}/.codex`,
+
+  async readStatus(path) {
+    const text = await readTextFile(path);
+    if (!text) {
+      return { configured: false, currentEndpoint: null, rawApiKey: null, currentModels: null };
+    }
+    // `base_url` is written inside `[model_providers.cartethyia]` (see `apply`
+    // below), so it must be read from that section. Reading it as a root key
+    // returned null for a config this very injector had just written, leaving
+    // the dashboard's endpoint field blank while the status said "configured".
+    const baseUrl = textGet(text, {
+      kind: "sectionKey",
+      section: `model_providers.${CODEX_PROVIDER}`,
+      key: "base_url",
+    });
+    const model = textGet(text, { kind: "flat", key: "model" });
+    const auth = (await readJsonFile(codexAuthPath())) as Record<string, string> | null;
+    const apiKey = auth?.[CODEX_PROVIDER] ?? null;
+    return {
+      configured: textHas(text, { kind: "section", section: `model_providers.${CODEX_PROVIDER}` }),
+      currentEndpoint: baseUrl,
+      rawApiKey: apiKey,
+      currentModels: model ? [model] : null,
+    };
+  },
+
+  async apply(input, path) {
+    const model = input.modelSlots?.session ?? input.activeModel ?? input.modelIds[0] ?? "";
+    const subagent = input.modelSlots?.subagent ?? input.subagentModel ?? model;
+    const review = input.modelSlots?.review;
+    const baseUrl = ensureV1Suffix(input.endpoint);
+    assertTomlSafeValue("model", model);
+    assertTomlSafeValue("subagent model", subagent);
+    if (review !== undefined) assertTomlSafeValue("review model", review);
+    assertTomlSafeValue("endpoint", baseUrl);
+
+    let text = (await readTextFile(path)) ?? "";
+    text = textRemove(text, { kind: "flat", key: "model" });
+    text = textRemove(text, { kind: "flat", key: "review_model" });
+    text = textRemove(text, { kind: "flat", key: "model_provider" });
+    text = textUpsert(text, { kind: "flat", key: "model", insertAtTop: true }, model);
+    if (review !== undefined)
+      text = textUpsert(text, { kind: "flat", key: "review_model", insertAtTop: true }, review);
+    text = textUpsert(
+      text,
+      { kind: "flat", key: "model_provider", insertAtTop: true },
+      CODEX_PROVIDER,
+    );
+    text = textUpsert(
+      text,
+      { kind: "section", section: `model_providers.${CODEX_PROVIDER}` },
+      [`  name = "Cartethyia"`, `  base_url = "${baseUrl}"`, `  wire_api = "responses"`].join("\n"),
+    );
+    text = textUpsert(
+      text,
+      { kind: "sectionKey", section: "agents", key: "default_subagent_model" },
+      subagent,
+    );
+    text = textRemove(text, { kind: "section", section: `model_providers.${CODEX_PROVIDER}.auth` });
+    text = textUpsert(
+      text,
+      { kind: "section", section: `model_providers.${CODEX_PROVIDER}.auth` },
+      [
+        `  command = "node"`,
+        `  args = ["${codexAuthHelperConfigPath()}"]`,
+        `  timeout_ms = 5000`,
+        `  refresh_interval_ms = 0`,
+      ].join("\n"),
+    );
+    await writeTextFileWithBackup(path, text);
+
+    const auth = ((await readJsonFile(codexAuthPath())) as Record<string, string> | null) ?? {};
+    auth[CODEX_PROVIDER] = input.apiKey;
+    await writeJsonFileWithBackup(codexAuthPath(), auth);
+    await writeTextFileWithBackup(codexAuthHelperPath(), CODEX_AUTH_HELPER_SOURCE);
+  },
+
+  async reset(path) {
+    let text = await readTextFile(path);
+    if (!text) {
+      await removeFile(codexAuthHelperPath());
+      return false;
+    }
+    text = textRemove(text, { kind: "section", section: `model_providers.${CODEX_PROVIDER}.auth` });
+    text = textRemove(text, { kind: "section", section: `model_providers.${CODEX_PROVIDER}` });
+    text = textRemove(text, {
+      kind: "sectionKey",
+      section: "agents",
+      key: "default_subagent_model",
+    });
+    text = textRemove(text, { kind: "section", section: "agents.subagent" });
+    if (textGet(text, { kind: "flat", key: "model_provider" }) === CODEX_PROVIDER) {
+      text = textUpsert(text, { kind: "flat", key: "model_provider", insertAtTop: true }, "openai");
+    }
+    await writeTextFileWithBackup(path, text);
+
+    const auth = (await readJsonFile(codexAuthPath())) as Record<string, string> | null;
+    if (auth?.[CODEX_PROVIDER]) {
+      delete auth[CODEX_PROVIDER];
+      await writeJsonFileWithBackup(codexAuthPath(), auth);
+    }
+    await removeFile(codexAuthHelperPath());
+  },
+
+  download(input) {
+    const model = input.modelSlots?.session ?? input.activeModel ?? input.modelIds[0] ?? "";
+    const subagent = input.modelSlots?.subagent ?? input.subagentModel ?? model;
+    const review = input.modelSlots?.review;
+    const baseUrl = ensureV1Suffix(input.endpoint);
+    assertTomlSafeValue("model", model);
+    assertTomlSafeValue("subagent model", subagent);
+    if (review !== undefined) assertTomlSafeValue("review model", review);
+    assertTomlSafeValue("endpoint", baseUrl);
+    const reviewLine = review === undefined ? "" : `review_model = "${review}"\n`;
+    const toml = [
+      `model = "${model}"`,
+      reviewLine.trimEnd(),
+      `model_provider = "${CODEX_PROVIDER}"`,
+      "",
+      `[model_providers.${CODEX_PROVIDER}]`,
+      `  name = "Cartethyia"`,
+      `  base_url = "${baseUrl}"`,
+      `  wire_api = "responses"`,
+      "",
+      `[model_providers.${CODEX_PROVIDER}.auth]`,
+      `  command = "node"`,
+      `  args = ["${codexAuthHelperConfigPath()}"]`,
+      `  timeout_ms = 5000`,
+      `  refresh_interval_ms = 0`,
+      "",
+      "[agents]",
+      `  default_subagent_model = "${subagent}"`,
+      "",
+    ]
+      .filter((line) => line.length > 0)
+      .join("\n");
+    const authJson = JSON.stringify({ [CODEX_PROVIDER]: input.apiKey }, null, 2);
+    return {
+      content: [
+        "# config.toml",
+        toml,
+        "# auth.json",
+        authJson,
+        `# ${CODEX_AUTH_HELPER_NAME} (save this script as ~/.codex/${CODEX_AUTH_HELPER_NAME})`,
+        CODEX_AUTH_HELPER_SOURCE,
+        "",
+      ].join("\n"),
+      filename: "codex-config.txt",
+      mimeType: "text/plain",
+    };
+  },
+
+  messages: {
+    applied: "Codex CLI settings applied",
+    reset: "Cartethyia settings removed from Codex",
+    resetMissing: "No config file to reset",
+  },
+};
+

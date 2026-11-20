@@ -1,0 +1,678 @@
+import { GatewayError } from "../protocol/gateway-error";
+import { log } from "../observability/logger";
+import { metrics } from "../observability/metrics";
+import { redisEvalTuple, type RedisClient } from "../persistence/redis";
+
+export interface ClientIdentity {
+  readonly address: string;
+  readonly source: "tcp-peer" | "trusted-forwarded-header";
+}
+
+/**
+ * Decodes the `{banned, count, bannedNow, retryAfterMs}` tuple the admission
+ * script returns.
+ *
+ * The script is the only producer, so a value that is not four elements or
+ * whose members are not finite numbers means the script/response pair drifted
+ * (a desynced deployment, a cluster resharding mid-eval). Reading such a value
+ * as a counter would silently admit or reject on garbage, so it throws instead
+ * — the caller maps that to the bounded `admission_unavailable` it already uses
+ * for an unreachable store.
+ */
+function decodeAbuseOutcome(raw: readonly unknown[]): IpAbuseOutcome {
+  if (raw.length !== 4) {
+    throw new Error(`[abuse] admission script returned ${raw.length} elements, expected 4`);
+  }
+  const [bannedRaw, countRaw, bannedNowRaw, retryAfterRaw] = raw.map((value) => Number(value));
+  const banned = bannedRaw ?? NaN;
+  const count = countRaw ?? NaN;
+  const bannedNow = bannedNowRaw ?? NaN;
+  const retryAfterMs = retryAfterRaw ?? NaN;
+  if (
+    !Number.isFinite(banned) ||
+    !Number.isFinite(count) ||
+    !Number.isFinite(bannedNow) ||
+    !Number.isFinite(retryAfterMs) ||
+    retryAfterMs < 0
+  ) {
+    throw new Error(`[abuse] admission script returned a non-finite value: ${String(raw)}`);
+  }
+  return { banned: banned === 1, count, bannedNow: bannedNow === 1, retryAfterMs };
+}
+
+/**
+ * Route slot the identity-wide ban counter is stored under.
+ *
+ * A real route can never collide with it: `/v1/*` paths always begin with a
+ * slash and this literal does not, so no client-supplied path can alias the
+ * escalation counter into its own per-route window.
+ */
+const BAN_ROUTE_KEY = "#ban";
+
+/**
+ * One admission step, as the store sees it.
+ *
+ * Both counters are derived here so the store can record them in one
+ * operation: `limit` sizes the per-route window (which must be able to report
+ * `limit + 1`, since a count above the limit is otherwise unrepresentable) and
+ * `banThreshold` is both the identity-wide escalation threshold and the
+ * highest count either ring must keep observable.
+ */
+interface IpAbuseAttempt {
+  readonly identity: string;
+  readonly route: string;
+  readonly now: number;
+  readonly limit: number;
+  readonly banThreshold: number;
+  readonly banDurationMs: number;
+}
+
+/** What one admission step decided. */
+interface IpAbuseOutcome {
+  /** The identity was already banned; nothing was incremented. */
+  readonly banned: boolean;
+  /** Attempts now in this route's window, including this one. `0` when banned. */
+  readonly count: number;
+  /** This attempt crossed the ban threshold, so the ban was recorded. */
+  readonly bannedNow: boolean;
+  /**
+   * Whole milliseconds until this identity may be retried, `0` when the
+   * attempt was admitted.
+   *
+   * The store is the only component that knows this: a ban's remainder is its
+   * marker's TTL, and a rate-limited window's remainder is the age of its
+   * oldest attempt. Both are server state. Answering every 429 with a fixed
+   * `retry-after: 3600` would tell a client hitting a 60-second window to wait
+   * sixty times longer than it had to — and tell a client whose ban had nearly
+   * elapsed to wait the full hour again.
+   */
+  readonly retryAfterMs: number;
+}
+
+export interface IpAbuseStore {
+  /**
+   * One atomic admission + escalation step: reads the ban, records the attempt
+   * against both the per-route window and the identity-wide escalation
+   * counter, and records the ban when the threshold is crossed.
+   *
+   * **One method, not four, because the Redis store pays a round trip per
+   * call.** The gateway runs this on every `/v1/*` request, so a
+   * read-then-increment-then-escalate sequence cost three round trips on the
+   * admitted path and four once a ban fired. The store must therefore decide
+   * and record in a single operation; both implementations do.
+   *
+   * **Two counters, and both are needed.** The window that admits or rejects a
+   * request is per `(identity, route)`, so a busy route cannot spend another
+   * route's budget — a client streaming chat completions does not lose its
+   * ability to call `/v1/models`. The escalation counter is per identity
+   * alone, because a ban is: keying escalation by route let a caller spread the
+   * same volume across paths and never reach the threshold, since each route's
+   * count stayed low. Collapsing them either breaks per-route fairness or
+   * leaves the ban evadable by rotating the path.
+   *
+   * Fail-closed: an unreachable store throws, and the caller maps that to a
+   * bounded `admission_unavailable` with zero dispatches.
+   */
+  checkAndRecord(attempt: IpAbuseAttempt): Promise<IpAbuseOutcome>;
+  /**
+   * Manually bans an identity for `durationMs` (0/negative = permanent).
+   * Throws when the store is unreachable.
+   */
+  ban(identity: string, durationMs: number): Promise<void>;
+  /** Lifts a manual (or any) ban on an identity. No-op when not banned. */
+  unban(identity: string): Promise<void>;
+  /** Lists currently active bans with their expiry (`null` = permanent). */
+  listBans(): Promise<readonly { identity: string; bannedUntil: number | null }[]>;
+}
+
+interface IpAbuseProtectionServiceOptions {
+  readonly maxRequestsPerWindow?: number;
+  readonly banThreshold?: number;
+  readonly banDurationMs?: number;
+}
+
+interface InMemoryIpAbuseStoreOptions {
+  readonly windowMs?: number;
+  readonly clock?: () => number;
+  /** Distinct (identity, route) keys tracked before the oldest is evicted. */
+  readonly maxKeys?: number;
+  /** Slots preallocated per key; the ring still grows to the ban ceiling for
+   *  keys that keep exceeding the admission limit. */
+  readonly capacityPerKey?: number;
+}
+
+/** Bounded circular buffer of recent request timestamps.
+ *  Capacity is the highest count the window must be able to report: once full
+ *  the oldest slot is overwritten in O(1), and `reserve` grows the ring for
+ *  keys that keep exceeding the admission limit (ban escalation needs counts
+ *  above the cap). Sweep is amortized against `push` — no full-map scan on
+ *  every incoming request. */
+class RingCounter {
+  private buf: Float64Array;
+  private head = 0;
+  private tail = 0;
+  private size = 0;
+  /** Slots in the ring — the highest count the window can report. */
+  capacity: number;
+  constructor(capacity: number) {
+    this.capacity = Math.max(1, capacity);
+    this.buf = new Float64Array(this.capacity);
+  }
+  /** Grows the ring in place, preserving the live entries in age order. */
+  reserve(capacity: number): void {
+    if (capacity <= this.capacity) return;
+    const next = new Float64Array(capacity);
+    for (let index = 0; index < this.size; index += 1) {
+      next[index] = this.buf[(this.head + index) % this.buf.length]!;
+    }
+    this.buf = next;
+    this.capacity = capacity;
+    this.head = 0;
+    this.tail = this.size % next.length;
+  }
+  /** Drops expired entries. O(k) where k is only what actually expired. */
+  prune(cutoff: number): void {
+    while (this.size > 0 && this.buf[this.head]! <= cutoff) {
+      this.head = (this.head + 1) % this.buf.length;
+      this.size -= 1;
+    }
+  }
+  count(): number {
+    return this.size;
+  }
+  /** Oldest live timestamp in the window, or `undefined` when empty. */
+  oldest(): number | undefined {
+    return this.size > 0 ? this.buf[this.head] : undefined;
+  }
+  push(now: number): void {
+    this.buf[this.tail] = now;
+    this.tail = (this.tail + 1) % this.buf.length;
+    if (this.size < this.buf.length) this.size += 1;
+    else this.head = (this.head + 1) % this.buf.length;
+  }
+}
+
+/** In-memory abuse store with O(1) per-key sliding-window counters and
+ *  bounded cardinality. Sweeps expired bans lazily on the touched key
+ *  instead of scanning the whole map on every request — the previous
+ *  behavior turned into an O(N) hot spot at 10k inflight. */
+export class InMemoryIpAbuseStore implements IpAbuseStore {
+  private counts = new Map<string, RingCounter>();
+  private banCounts = new Map<string, RingCounter>();
+  private bans = new Map<string, number>();
+  private failing = false;
+  private readonly windowMs: number;
+  private readonly clock: () => number;
+  private readonly maxKeys: number;
+  private readonly capacityPerKey: number;
+
+  constructor(windowOrOptions: number | InMemoryIpAbuseStoreOptions = 60_000) {
+    const options =
+      typeof windowOrOptions === "number" ? { windowMs: windowOrOptions } : windowOrOptions;
+    this.windowMs = options.windowMs ?? 60_000;
+    this.clock = options.clock ?? (() => Date.now());
+    // 10k keys is a few MB even at the default 540 RPM ring size; the previous
+    // 100k bound could reach ~190 MB, and a fan-out over unique source IPs is
+    // the one input that can actually reach it.
+    this.maxKeys = options.maxKeys ?? 10_000;
+    // Sizes only the well-behaved path: a key that exceeds the admission limit
+    // still grows its ring to the ban ceiling, so a smaller preallocation
+    // cannot make a count above `limit` unrepresentable.
+    this.capacityPerKey = options.capacityPerKey ?? 64;
+  }
+
+  simulateFailure(failing: boolean): void {
+    this.failing = failing;
+  }
+
+  /** Distinct keys currently tracked; sampled as a memory gauge. */
+  keyCount(): number {
+    return this.counts.size;
+  }
+
+  private key(identity: string, route: string): string {
+    return `${identity}::${route}`;
+  }
+
+  /** Evicts the oldest entries of `map` down to `maxKeys` in a single pass so
+   *  an adversarial fan-out over unique identities cannot pin memory. Deleting
+   *  one entry at a time is O(1) but starves reclaim. */
+  private evictOldest<K, V>(map: Map<K, V>): void {
+    if (map.size < this.maxKeys) return;
+    let toEvict = map.size - this.maxKeys + 1;
+    for (const key of map.keys()) {
+      if (toEvict-- <= 0) break;
+      map.delete(key);
+    }
+  }
+
+  private getOrCreate(
+    map: Map<string, RingCounter>,
+    key: string,
+    capacity: number,
+  ): RingCounter {
+    let counter = map.get(key);
+    if (!counter) {
+      this.evictOldest(map);
+      counter = new RingCounter(capacity);
+      map.set(key, counter);
+    }
+    return counter;
+  }
+
+  /**
+   * Outage injection for tests, mirroring the store's own reachability.
+   *
+   * The service does not probe the store before using it: every method below
+   * throws when the store is unreachable, and the service's catch maps that to
+   * a bounded `admission_unavailable`. A separate probe would only add a round
+   * trip to every request on the Redis store.
+   */
+  private assertAvailable(): void {
+    if (this.failing) throw new Error("ip store unavailable");
+  }
+
+  /**
+   * Attempts currently inside the sliding window for one (identity, route).
+   *
+   * In-memory-only introspection: the service reads counts from
+   * {@link checkAndRecord}'s return value, so this is not part of the store
+   * contract and the Redis store has no equivalent.
+   */
+  async getCount(identity: string, route: string, now = this.clock()): Promise<number> {
+    this.assertAvailable();
+    const counter = this.counts.get(this.key(identity, route));
+    if (!counter) return 0;
+    counter.prune(now - this.windowMs);
+    return counter.count();
+  }
+
+  /**
+   * Whether `identity` is currently banned. In-memory-only introspection for
+   * tests, mirroring {@link getCount}: the service learns this from
+   * {@link checkAndRecord}'s `banned` flag, so it is not part of the contract.
+   */
+  async isBanned(identity: string, now = this.clock()): Promise<boolean> {
+    this.assertAvailable();
+    const until = this.bans.get(identity);
+    if (until === undefined) return false;
+    if (until <= now) {
+      this.bans.delete(identity);
+      return false;
+    }
+    return true;
+  }
+
+  async ban(identity: string, durationMs: number): Promise<void> {
+    this.assertAvailable();
+    this.evictOldest(this.bans);
+    this.bans.set(identity, durationMs > 0 ? this.clock() + durationMs : Number.POSITIVE_INFINITY);
+  }
+
+  async unban(identity: string): Promise<void> {
+    this.assertAvailable();
+    this.bans.delete(identity);
+  }
+
+  async listBans(): Promise<readonly { identity: string; bannedUntil: number | null }[]> {
+    this.assertAvailable();
+    const now = this.clock();
+    const out: { identity: string; bannedUntil: number | null }[] = [];
+    for (const [identity, until] of this.bans) {
+      if (until <= now) {
+        this.bans.delete(identity);
+        continue;
+      }
+      out.push({
+        identity,
+        bannedUntil: Number.isFinite(until) ? until : null,
+      });
+    }
+    return out;
+  }
+
+  async checkAndRecord(attempt: IpAbuseAttempt): Promise<IpAbuseOutcome> {
+    this.assertAvailable();
+    const { identity, route, now, limit, banThreshold, banDurationMs } = attempt;
+
+    // The ban is read first and, when live, short-circuits: a banned identity
+    // records nothing, so it can neither extend its own counters nor defer the
+    // ban it already earned.
+    const until = this.bans.get(identity);
+    if (until !== undefined) {
+      if (until > now) return { banned: true, count: 0, bannedNow: false, retryAfterMs: until - now };
+      this.bans.delete(identity);
+    }
+
+    const window = this.getOrCreate(
+      this.counts,
+      this.key(identity, route),
+      Math.max(this.capacityPerKey, limit + 1),
+    );
+    window.prune(now - this.windowMs);
+    // Grow only for keys that actually exceed the base ring: a well-behaved
+    // client never allocates past `capacityPerKey`, while a key that keeps
+    // hammering past the limit can still count up to the ban threshold.
+    if (window.count() >= window.capacity) window.reserve(banThreshold);
+    window.push(now);
+    const count = window.count();
+    // Mirrors the script's measured wait: a window over its limit reports how
+    // long until its oldest attempt ages out. `count > limit` is the same
+    // rejection the service applies below.
+    let retryAfterMs = 0;
+    if (count > limit) {
+      const oldest = window.oldest();
+      if (oldest !== undefined) retryAfterMs = Math.max(0, oldest + this.windowMs - now);
+    }
+
+    // Escalation counts every attempt against one identity-wide ring, so
+    // spreading the same volume over many paths cannot keep each route's count
+    // below the threshold.
+    const banCounter = this.getOrCreate(
+      this.banCounts,
+      this.key(identity, BAN_ROUTE_KEY),
+      banThreshold,
+    );
+    banCounter.prune(now - this.windowMs);
+    banCounter.push(now);
+    const bannedNow = banCounter.count() >= banThreshold;
+    if (bannedNow) {
+      // Bans are keyed by identity alone, so the same bound applies: expired
+      // entries are only dropped when their identity is looked up again, which
+      // a rotating fan-out never does.
+      this.evictOldest(this.bans);
+      this.bans.set(identity, now + banDurationMs);
+      retryAfterMs = banDurationMs;
+    }
+    return { banned: false, count, bannedNow, retryAfterMs };
+  }
+}
+
+/**
+ * Per-IP rate-limit/ban layer for `/v1/*` gateway routes.
+ *
+ * Independent of ApiKeyAdmissionService: the ingress middleware skips
+ * `/health`, `/health/ready` and everything outside `/v1/*`, and console auth
+ * is covered by its own DB-persisted ConsoleLockoutService.
+ *
+ * **Two counters, and both are needed.** The window that admits or rejects a
+ * request is per `(identity, route)`, so a busy route cannot spend another
+ * route's budget — a client streaming chat completions does not lose its
+ * ability to call `/v1/models`. The ban counter is per identity alone,
+ * because a ban is: keying escalation by route let a caller spread the same
+ * volume across paths and never reach the threshold, since each route's count
+ * stayed low. The two are separate on purpose — one decides admission, the
+ * other decides escalation, and collapsing them either breaks per-route
+ * fairness or leaves the ban evadable by rotating the path.
+ *
+ * Fail-closed on store outage: bounded `admission_unavailable`, zero
+ * dispatches.
+ */
+export class IpAbuseProtectionService {
+  private readonly maxRequestsPerWindow: number;
+  private readonly banThreshold: number;
+  private readonly banDurationMs: number;
+
+  constructor(
+    private readonly store: IpAbuseStore,
+    private readonly clock: () => number = () => Date.now(),
+    opts: IpAbuseProtectionServiceOptions = {},
+  ) {
+    if (!store)
+      throw new Error("IpAbuseProtectionService requires a store — fail-closed, not no-op");
+    // 540 requests per 60 s window = 9 RPS/IP steady-state cap. Aligns
+    // with the documented default: unset env → 540 RPM per IP, not
+    // unlimited. Operators raise or lower via IP_RATE_MAX_PER_WINDOW.
+    this.maxRequestsPerWindow = opts.maxRequestsPerWindow ?? 540;
+    // A ban only makes sense once the limit was breached, so the threshold is
+    // clamped above the cap: below it, escalation would be unreachable (the
+    // count can never exceed `maxRequestsPerWindow` without being rejected).
+    this.banThreshold = Math.max(opts.banThreshold ?? 1080, this.maxRequestsPerWindow + 1);
+    this.banDurationMs = opts.banDurationMs ?? 60 * 60 * 1000;
+  }
+
+  async checkBeforeAccess(input: {
+    readonly identity: ClientIdentity;
+    readonly route: string;
+    readonly signal?: AbortSignal;
+  }): Promise<void> {
+    if (input.signal?.aborted) {
+      throw new GatewayError("admission_unavailable", 503, "The abuse check never ran because the request was already cancelled (request {requestId}). Send it again whenever ready 🙃", {
+        reason: "admission-unavailable",
+      });
+    }
+    const now = this.clock();
+    const ip = input.identity.address;
+
+    try {
+      // One atomic step: the store reads the ban, records this attempt against
+      // both the per-route window and the identity-wide escalation counter, and
+      // records the ban if the threshold is crossed. Concurrent callers cannot
+      // race past the limit, and rejected attempts keep counting toward the ban
+      // instead of being silently dropped.
+      const outcome = await this.store.checkAndRecord({
+        identity: ip,
+        route: input.route,
+        now,
+        limit: this.maxRequestsPerWindow,
+        banThreshold: this.banThreshold,
+        banDurationMs: this.banDurationMs,
+      });
+
+      // Logged once, at the transition. A ban is the one state here the
+      // operator cannot see from a metric and cannot wait out by guessing:
+      // every request afterwards answers 429 with the same message, whether
+      // the address is banned or merely over the window. Naming the address,
+      // the count that tripped it, and how long it lasts is what turns
+      // "429, sometimes" into something to act on.
+      if (outcome.bannedNow) {
+        log.warn(
+          `ip abuse: banned ${ip} for ${Math.round(this.banDurationMs / 60_000)}min` +
+            ` (route ${input.route}, ceiling ${this.banThreshold})`,
+        );
+      }
+
+      if (outcome.banned) {
+        metrics.cartethyia_ip_abuse_refusals_total.inc(1, { reason: "ip-banned" });
+        throw new GatewayError("rate_limited", 429, "This address is temporarily banned for too many failed requests (request {requestId}). Wait for the ban to lift, then slow down. You've maxed this window — pace yourself ⏳", {
+          // Distinguishes this from the rate-limited 429 below and from an API
+          // key's own budget. It used to be "admission-unavailable", which is
+          // the label for an *unreachable* store — so every refusal from this
+          // layer claimed an outage that had not happened, and a client could
+          // not tell "banned" from "over the window" from "store is down".
+          reason: "ip-banned",
+          ip,
+          route: input.route,
+          // Measured by the store: the ban marker's remaining TTL. Carried as
+          // the standard wait hint so the error normalization emits the real
+          // remainder instead of a fixed hour.
+          ...(outcome.retryAfterMs > 0 ? { retryAfterMs: outcome.retryAfterMs } : {}),
+        });
+      }
+
+      if (outcome.count > this.maxRequestsPerWindow) {
+        metrics.cartethyia_ip_abuse_refusals_total.inc(1, { reason: "ip-rate-limited" });
+        throw new GatewayError("rate_limited", 429, "This address is sending requests faster than the abuse limit allows (request {requestId}). Back off and retry after the window rolls over. You've maxed this window — pace yourself ⏳", {
+          reason: "ip-rate-limited",
+          ip,
+          route: input.route,
+          count: outcome.count,
+          ...(outcome.retryAfterMs > 0 ? { retryAfterMs: outcome.retryAfterMs } : {}),
+        });
+      }
+    } catch (err) {
+      if (err instanceof GatewayError) throw err;
+      throw new GatewayError("admission_unavailable", 503, "The abuse-tracking store is unreachable, so requests from this address cannot be checked (request {requestId}). Retry shortly. The bouncer stepped out — come back shortly 🚪", {
+        reason: "admission-unavailable",
+        cause: (err as Error).message,
+      });
+    }
+  }
+}
+
+/**
+ * The one admission + escalation step, as a static Lua script.
+ *
+ * `KEYS[1]` is the per-route window, `KEYS[2]` the identity-wide escalation
+ * counter, `KEYS[3]` the ban. Both counters are sorted sets of
+ * `<timestamp>:<uuid>` members, so a burst of attempts inside one millisecond
+ * cannot collapse into a single member and undercount.
+ *
+ * `ARGV`: 1 now(ms), 2 windowMs, 3 limit, 4 banThreshold, 5 banDurationMs,
+ * 6 per-route member, 7 escalation member.
+ *
+ * Returns a `{banned, count, bannedNow, retryAfterMs}` tuple. The ban is read
+ * first and short-circuits without writing, so a banned identity cannot keep
+ * extending its own counters. Both rings are trimmed to `banThreshold` members
+ * so an abusive key cannot grow them without bound. The ban key carries the
+ * ban duration as its TTL, so an expired ban needs no sweeper.
+ *
+ * `retryAfterMs` is measured, never assumed: a live ban reports the marker's
+ * remaining TTL (`PTTL`, so the answer shrinks as the ban elapses), a
+ * rate-limited window reports how long until its oldest attempt leaves the
+ * window, and an admitted attempt reports 0. The middleware answers with this
+ * instead of a fixed one-hour value that over-stated every wait.
+ */
+const IP_ADMISSION_SCRIPT = `
+  local function asSortedSet(key)
+    local kind = redis.call('TYPE', key)
+    local name = kind['ok'] or kind
+    if name ~= 'none' and name ~= 'zset' then redis.call('DEL', key) end
+  end
+  local function asString(key)
+    local kind = redis.call('TYPE', key)
+    local name = kind['ok'] or kind
+    if name ~= 'none' and name ~= 'string' then redis.call('DEL', key) end
+  end
+  asString(KEYS[3])
+  asSortedSet(KEYS[1])
+  asSortedSet(KEYS[2])
+  local banned = redis.call('GET', KEYS[3])
+  if banned and tonumber(banned) > tonumber(ARGV[1]) then
+    local ttl = redis.call('PTTL', KEYS[3])
+    if ttl < 0 then ttl = 0 end
+    return {1, 0, 0, ttl}
+  end
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, tonumber(ARGV[1]) - tonumber(ARGV[2]))
+  local count = redis.call('ZCARD', KEYS[1])
+  local retryAfterMs = 0
+  if count >= tonumber(ARGV[3]) then
+    local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+    if oldest[2] then
+      retryAfterMs = tonumber(oldest[2]) + tonumber(ARGV[2]) - tonumber(ARGV[1])
+      if retryAfterMs < 0 then retryAfterMs = 0 end
+    end
+  end
+  redis.call('ZADD', KEYS[1], ARGV[1], ARGV[6])
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  if count >= tonumber(ARGV[4]) then
+    redis.call('ZREMRANGEBYRANK', KEYS[1], 0, count - tonumber(ARGV[4]))
+  end
+  redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, tonumber(ARGV[1]) - tonumber(ARGV[2]))
+  local banCount = redis.call('ZCARD', KEYS[2])
+  redis.call('ZADD', KEYS[2], ARGV[1], ARGV[7])
+  redis.call('PEXPIRE', KEYS[2], ARGV[2])
+  if banCount >= tonumber(ARGV[4]) then
+    redis.call('ZREMRANGEBYRANK', KEYS[2], 0, banCount - tonumber(ARGV[4]))
+  end
+  local bannedNow = 0
+  if banCount + 1 >= tonumber(ARGV[4]) then
+    redis.call('SET', KEYS[3], tonumber(ARGV[1]) + tonumber(ARGV[5]), 'PX', ARGV[5])
+    bannedNow = 1
+    retryAfterMs = tonumber(ARGV[5])
+  end
+  return {0, count + 1, bannedNow, retryAfterMs}
+`;
+
+export class RedisIpAbuseStore implements IpAbuseStore {
+  constructor(
+    private readonly redis: RedisClient,
+    private readonly windowMs = 60_000,
+  ) {}
+  private key(identity: string, route: string): string {
+    return `cartethyia:ip:${identity}:${route}`;
+  }
+  /** Identity-wide escalation counter; distinct prefix from the per-route key. */
+  private banKey(identity: string): string {
+    return `cartethyia:ip:ban-count:${identity}`;
+  }
+  /** The ban marker; its value is the ban's expiry and its TTL is the duration. */
+  private banMarkerKey(identity: string): string {
+    return `cartethyia:ip:ban:${identity}`;
+  }
+
+  async checkAndRecord(attempt: IpAbuseAttempt): Promise<IpAbuseOutcome> {
+    const { identity, route, now, limit, banThreshold, banDurationMs } = attempt;
+    const raw = await redisEvalTuple(
+      this.redis,
+      IP_ADMISSION_SCRIPT,
+      3,
+      this.key(identity, route),
+      this.banKey(identity),
+      this.banMarkerKey(identity),
+      String(now),
+      String(this.windowMs),
+      String(limit),
+      String(banThreshold),
+      String(Math.max(1, banDurationMs)),
+      `${now}:${crypto.randomUUID()}`,
+      `${now}:${crypto.randomUUID()}`,
+    );
+    return decodeAbuseOutcome(raw);
+  }
+
+  async ban(identity: string, durationMs: number): Promise<void> {
+    const marker = this.banMarkerKey(identity);
+    const now = Date.now();
+    if (durationMs > 0) {
+      await this.redis.set(marker, String(now + durationMs), "PX", durationMs);
+    } else {
+      // Permanent: no TTL; a large sentinel far in the future.
+      await this.redis.set(marker, String(Number.MAX_SAFE_INTEGER));
+    }
+  }
+
+  async unban(identity: string): Promise<void> {
+    await this.redis.del(this.banMarkerKey(identity));
+  }
+
+  async listBans(): Promise<readonly { identity: string; bannedUntil: number | null }[]> {
+    // `KEYS` blocks Redis for the whole keyspace scan, and one GET per ban is
+    // a round trip per ban. SCAN iterates in bounded cursors and one pipelined
+    // GET per batch keeps the round trips flat (same policy as
+    // `persistence/shared-cache.ts`).
+    const keys: string[] = [];
+    let cursor = "0";
+    do {
+      const [next, batch] = await this.redis.scan(cursor, "MATCH", "cartethyia:ip:ban:*", "COUNT", 500);
+      cursor = next;
+      keys.push(...batch);
+    } while (cursor !== "0");
+    const now = Date.now();
+    const out: { identity: string; bannedUntil: number | null }[] = [];
+    const stale: string[] = [];
+    if (keys.length > 0) {
+      const pipeline = this.redis.pipeline();
+      for (const key of keys) pipeline.get(key);
+      const results = await pipeline.exec();
+      for (let index = 0; index < keys.length; index += 1) {
+        const key = keys[index]!;
+        const [error, value] = results?.[index] ?? [null, null];
+        if (error) throw error;
+        const until = Number(value ?? 0);
+        if (!Number.isFinite(until) || until <= now) {
+          stale.push(key);
+          continue;
+        }
+        out.push({
+          identity: key.slice("cartethyia:ip:ban:".length),
+          bannedUntil: until >= Number.MAX_SAFE_INTEGER - 1 ? null : until,
+        });
+      }
+    }
+    // Expired and malformed markers are cleaned up in one call, as before.
+    if (stale.length > 0) await this.redis.del(...stale);
+    return out;
+  }
+}
+

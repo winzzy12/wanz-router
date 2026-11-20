@@ -1,0 +1,356 @@
+# Reverse-engineering techniques: unpack, string-scan, beautify, wire capture
+
+General toolkit for figuring out what a closed-source client (CLI, desktop
+app, or SDK) does, without launching it — and for capturing its real outbound
+wire when static inspection cannot pin the exact request shape. These
+techniques were proven on real vendors (Kiro, Cursor, CodeBuddy, OpenCode,
+Grok); per-provider findings live in `documentation/research/` (see below).
+
+## 0. Working order
+
+1. **Get the artifact** (installer/exe/dmg/msi) — prefer the version the
+   vendor currently ships.
+2. **Unpack it** (static inspection only — never launch) — see §1.
+3. **String-scan** the unpacked bundles and binaries — see §2.
+4. **Beautify** minified JS to make it readable — see §3.
+5. **Capture the real wire** when you need byte-level proof — see §4.
+6. Keep evidence in scratch (`D:\tmp\scratch\`); never commit credentials —
+   redact `authorization` headers before adding samples to the repo.
+
+## 1. Unpacking artifacts
+
+| Artifact | Tool / recipe |
+|---|---|
+| `.dmg` (macOS) | `7z x <file>.dmg` → `4.hfs` (HFS+), then `7z x 4.hfs` → app volume |
+| `.exe` (Inno Setup) | `innoextract` (use a recent fork for Setup ≥6.4; 1.9 errors on 6.4.0.1). **`innoextract 1.13.0` extracts 6.4 fine** (proven on Qoder IDE 1.38 — no manual LZMA needed). For 6.4+ when 1.13 is unavailable use the manual LZMA recovery below — `7z x` only yields the compressed container `[0]` (not a bare LZMA stream). **Also: `innounp 2.70.1` (winget `JurgenRathlev.innounp`) handles Setup 6.4.0.1** in one pass. **Gotcha: options MUST come before the setup path** — `innounp -x -y -d <outdir> <setup.exe>`. Putting `-d <dir>` *after* the exe makes it a filemask: exit 0, no files extracted (hit live on Devin 3.11.238). Verify extraction by counting files, not by exit code |
+| `.msi` | `7z x` → unpacked payload (may contain a single-file executable) |
+| `app.asar` (Electron) | `bun scripts/tools/asar-unpack.mjs <app.asar> <outdir>`. Nativev2 header: `[u32 @0]=4`, `[u32 @4]=header+8`, `[u32 @8]=header+4`, `[u32 @12]=header JSON length`, JSON begins at offset 16. **Offsets are relative to the data section start (`16 + headerSize`), not absolute** — reading them absolute yields garbage (verified) |
+| Single-file Bun/Rust executables | Bun compiled: use `unbuned` (Python, zero-dep, GitHub `vibheksoni/unbuned`) — `python unbuned.py -a -o <outdir> <exe>` extracts modules (JS per chunk), assets (decompressed), bytecode (`.jsc`), and a `manifest.json`. **`7z x` does NOT see the embedded FS** — the Bun bundle lives in a custom section (PE `.bun` / Mach-O `__BUN.__bun`), not a standard archive. Fallback for manual section slicing: parse PE section table (off `fileHeader+20+optSize`, 40B entries: `Name[8] VirtualSize[4]@8 VirtualAddress@12 SizeOfRawData@16 PointerToRawData@20`) or Mach-O `section_64` (`addr@24 size@32 offset@40` — offset is **@40**, not @44). Rust: `7z x` often extracts embedded bundles; else string-scan (see §2) —
+
+### Inno Setup ≥6.4 (e.g. Antigravity IDE 2.6.0)
+
+`innoextract 1.9` errors on Setup 6.4.0.1 ("Unexpected setup data
+version"). Manual recovery works. There are **two independent payloads**:
+the setup headers (file table) and the data blob. Proven on
+Antigravity IDE 2.6.0 (Google VS Code fork).
+
+**A. Loader offset table — where everything lives.**
+Inno ≥5.1.5 stores offsets in a PE resource named `11111` (RCDATA).
+`7z x` extracts it (`.rsrc\0\RCDATA\11111`, 44 bytes). Parse per
+innoextract `src/loader/offsets.cpp`:
+- magic 12B (`rDlPtS\xcd\xe6\xd7{\x0b*` for 5.1.5+), revision u32 (=1),
+  then (checksum-fed) u32s: `exe_offset`, `exe_compressed_size` (=0 for
+  ≥4.1.6), `exe_uncompressed_size`, `exe_crc32`, `header_offset`,
+  `data_offset`, trailing `expected_checksum`.
+- Verify: `header_offset` holds the 64-byte version string
+  (`Inno Setup Setup Data (6.4.0.1)`); `data_offset` points at the
+  `zlb\x1A` data container.
+
+**B. Setup-header block (file table).**
+At `header_offset + 64` is the block header:
+`[crc32 u32][stored_size u32][compression u8]` (compression 1 = LZMA1;
+crc32 covers the next 5 bytes — verified). The following `stored_size`
+bytes are **NOT one LZMA stream**: they are chunked blocks, each
+`[crc32 u32][payload up to 4096B]` (last chunk shorter). Strip each crc,
+concatenate — the result is a raw LZMA1 stream (`5D ...` props, no size
+header). Decompress with Python `lzma.FORMAT_RAW` (filters lc/lp/pb from
+prop byte, dict_size u32 LE). Output is the setup header: UTF-16LE binary
+strings then counts (language/message/permission/type/component/task/
+directory/file/data_entry/icon/ini/registry/delete/uninstall_delete/run/
+uninstall_run).
+- **Caveat.** Inno 6.4 field order differs from 6.1: observed non-numeric
+  bytes where 6.1 expects counts (ASCII `IFPS` lands in the
+  permission_count slot; file_count read 0 despite a huge data blob). Treat
+  6.4 as an unknown variant — do not trust 6.1 offsets.
+
+**C. Data blob.**
+`data_offset` is the data container: `zlb\x1A` + raw LZMA1 (props
+immediately, no size header). Build a standalone 13-byte header (5 prop
+bytes + 8×0xFF unknown size) and feed it to `7z x` → decompresses to a
+~950 MB concatenated payload (often begins MZ; Electron / VS-Code-fork
+apps carry `resources/` files sequentially in it). This is the file
+content; names/offsets come from the header file table (B).
+
+PowerShell gotcha: `[0]` in a path is treated as a wildcard character
+class — use `-LiteralPath` (or `Resolve-Path -LiteralPath`) when reading
+files named like `[0]`.
+
+### Qoder IDE desktop (Inno Setup 6.4, v1.38.0)
+
+Source binary: `D:\tmp\binaries\QoderIDEUserSetup-x64.exe` (207,886,256 B,
+produced 2026-11-02). `innoextract 1.13.0` extracts it in one pass — no
+manual LZMA recovery needed.
+
+```
+innoextract-1.13.0-windows.exe --extract --output-dir <dst> QoderIDEUserSetup-x64.exe
+```
+
+Output layout (Electron / VS Code fork):
+
+- `code$GetDestDir\Qoder IDE.exe` (226 MB Electron shell)
+- `code$GetDestDir\resources\app\` — unpacked app (this fork ships **unpacked**,
+  no `app.asar`)
+  - `product.json` — `nameShort: "Qoder"`, `dataFolderName: ".qoder"`,
+    `win32AppUserModelId: "AlibabaCloud.Qoder"`, version 1.38.0
+  - `package.json` — `Qoder IDE` / `1.38.0`
+  - `out\lingma\agents-window\agents-window.desktop.main.js` (56 MB) — agent UI
+  - `out\lingma\aura-buddy\` etc.
+  - `out\vs\workbench\workbench.desktop.main.js`, `out\vs\code\electron-utility\sharedProcess\sharedProcessMain.js`
+  - `node_modules\@ali\qoder-config-service-sdk\` — config service SDK
+- `app\tools\inno_updater.exe`, `vcruntime140.dll` — installer tools
+
+Wire takeaways (Qoder IDE 1.38):
+
+- **Hosts**: `center.qoder.sh` (big-model/center), `openapi.qoder.sh`
+  (business), `qts2.qoder.sh` (quest — deprecated), `api2.qoder.sh`
+  (dynamic region default). CN: `gateway.qoder.com.cn` / `openapi.qoder.com.cn`.
+- **Dynamic endpoints**: the IDE does NOT hardcode the chat host. It calls
+  `GET /algo/api/v2/service/region/endpoints` (on center) and reads
+  `preferredInferenceNode.endpoint` (fallback `api2.qoder.sh`). Inference URLs
+  are built as `<inferenceEndpoint> + path` (e.g. voice polish
+  `/api/v2/service/voice/polish`, WebSocket `/api/v2/service/ws/asr`,
+  telemetry `/apm`).
+- Legacy COSY chat (`/algo/api/v2/service/pro/sse/agent_chat_generation`) and
+  the modern `/model/v1/chat/completions` are **not present** as literals in
+  the 1.38 bundles — chat now goes through the region-resolved inference
+  endpoint. The Cartethyia adapter still defaults to `/model/v1/chat/completions`
+  on `api2-v2.qoder.sh` with COSY fallback; see
+  `documentation/research/qoder/archive/qoder-research-archive-2026-11-11.zip` (`2026-11-05-qoder-wire-reference-adapter-alignment.md`).
+
+### Bun-compiled CLI (Qoder `qodercli`, v1.1.83, Windows x64)
+
+Distro: `https://qoder-ide.oss-accelerate.aliyuncs.com/qodercli/channels/manifest.json`
+→ `files[]` per OS/arch; Windows `standard` = runtime `bun`, `legacy` =
+runtime `node-sea`. Manual: `curl -sL <url> -o qodercli-windows-x64.zip` +
+verify SHA256 from the manifest.
+
+Unpack with `unbuned` (Python, zero-dep):
+
+```
+python unbuned.py -a -o <outdir> qodercli.exe
+```
+
+Result (proven 2026-11-05):
+
+- `qodercli.js` — main bundle (509 KB), footprint only: start `// @bun @bytecode`.
+- `modules/` — 428 files (one per chunk, `0000-chunk-….js`, `0007-qodercli.js`,
+  `0009-worker.js` …) — **also bytecode stubs**, not the real logic.
+- `assets/` — 244 decompressed assets: native (`sharp-win32-x64.node`,
+  `libvips-*.dll`, `conpty.node`), wasm (`photon_rs_bg.wasm`), binaries
+  (`rg.exe`), and everything else (`.mjs`, `.html`, `.md`, `.ts`).
+- `bytecode/` — 431 `.jsc` blobs (JSC bytecode, 40 MB).
+- `manifest.json` — entry `B:/~BUN/root/qodercli`, flags include
+  `cross_compiled_bytecode`, `bytecode_module_count 427/428`.
+
+**Pitfall — JSC bytecode.** `bytecode_compiled: true` + `cross_compiled_bytecode`
+flag: 427 of 428 modules run bytecode, not source. Extracted `.js` files are
+stubs; the real logic is in the `.jsc` blobs (hard to decode, needs JS Core
+internals; no sourcemaps — `with_sourcemap: 0`). Plan static analysis around
+assets, entry behavior, and string/edge scanning instead of full source.
+
+**Using bun.bin directly.** Section export: custom PE/Mach-O section parser (see
+table above). Inside `.bun`, the file-name table lists every module as
+`B:/~BUN/root/<name>` (Windows) or `$bunfs/root/<name>` (POSIX) — grep it to
+enumerate embedded file names without decoding the container. `7z` cannot open
+the section.
+
+### Devin desktop (Inno Setup 6.4, v3.11.238)
+
+Source binary: `D:\tmp\binaries\DevinUserSetup-x64-3.11.238.exe` (284,545,920 B,
+built 2026-11-06, CompanyName Codeium, ProductName Devin). Unpacked with
+`innounp 2.70.1` in one pass — no manual LZMA recovery needed:
+
+```
+innounp -x -y -d D:\tmp\unpacked\devin D:\tmp\binaries\DevinUserSetup-x64-3.11.238.exe
+```
+
+Result: **14,616 files, ~1.31 GB** (scratch `D:\tmp\unpacked\devin\`).
+Output layout:
+
+- `{code_GetDestDir}\` — VS Code fork desktop surface (chrome `.pak`, `d3dcompiler_47.dll`, `dxcompiler.dll`, `ffmpeg.dll`, `libEGL/GLESv2.dll`, `vk_swiftshader.dll`, `vulkan-1.dll`, `icudtl.dat`, `snapshot_blob.bin`)
+- `{code_GetDestDir}\resources\app\out\vs\workbench\devin-webapp-host\` — Devin webapp host: thousands of content-hashed `assets\*.js` bundles (e.g. `superdevin-*.js`, `session-*.js`, `skill-*.js`) — thin VS Code chrome, Devin logic lives here
+- `{code_GetDestDir}\resources\app\resources\win32\` — icons
+- `{code_GetDestDir}\resources\app\out\vscode-dts\vscode.d.ts` — extension API typings
+- `{code_GetDestDir}\bin\` — `{code_GetBinDirApplicationFilename}` (console + GUI launchers)
+- `{code_GetDestDir}\policies\Devin.admx` — Windows group policy definitions
+- `{app}\appx\devin_x64.appx` + `devin_explorer_command_x64.dll` — packaged appx payload
+- `{app}\tools\inno_updater.exe`, `vcruntime140.dll` — installer tools
+- `install_script.iss` — Inno script
+
+### Devin OAuth — static-to-live flow (proven 2026-11-06, Google provider)
+
+Reconstructed entirely from static bundle analysis — no donor code, no SDK.
+Files: `devin-webapp-host/assets/app-initial-Sul-BBHA.js`,
+`app-initial-C64Yu33K.js`, `app-initial-B5PhWzwv.js`,
+`callback-CQ5-zgeD.js`.
+
+1. **Config lives in the mangled bundle.** `app-initial-Sul-BBHA.js`
+   defines `sd=auth.devin.ai` (Auth0 domain), `cd=DjKr4B4qtVDBVMBzE4FvveclTSkJYfhk`
+   (Auth0 client id), `ld=https://backend.webapp.devin.ai` (audience),
+   `Ku` → API base `https://api.devin.ai`. Trace import aliases
+   (`dn as g`, `un as v`, `ln as _` in `app-initial-C64Yu33K.js` — i.e.
+   `g=sd`, `v=cd`, `_=ld`) to see where they feed the Auth0 provider config.
+2. **External OAuth client IDs are NOT in the bundle.** `Jh` map
+   (github/google/openai) holds only `authorizeUrl`+`scope`; `client_id`
+   comes from `POST /api/auth1/connections` (`{product:"devin"}`) →
+   `connections[]` (`github: Iv1.fffb955bc006997f`, google `686954959906-...`,
+   `openai: oaiapp_...`).
+3. **PKCE S256 everywhere.** verifier = base64url(32 random bytes) trimmed to
+   43 chars; challenge = base64url(SHA256(verifier)). State format
+   `auth1-<csrf>.<id>` / `auth1-<id>` (`jm()`).
+4. **Exchange dispatcher** (`callback-CQ5-zgeD.js`):
+   `POST /api/auth1/{provider}/exchange` body `{code, mode, code_verifier,
+   redirect_uri, connection_id?, nonce?, signup_consent_version?}`; oidc
+   `/api/auth1/oidc/exchange`; saml `/api/auth1/saml/request` +
+   `/saml/consume`; openai link `/api/auth1/openai/link`. Success:
+   `{status:"authenticated", token:"auth1_...", user_id, email, ...}`.
+5. **Redirect URIs:** external OAuth → `https://auth.devin.ai/login/callback`;
+   Auth0 webapp → `https://app.devin.ai/post-auth`.
+6. **Auth1 token ≠ full access.** Every `api.devin.ai` endpoint (including
+   `/v1/models`) returns **401 `{"detail":"No organizations found for auth1 user"}`**
+   until the account has an org. Create/join org first.
+
+Probe scripts: `scripts/provider-probing/devin/devin-oauth-capture.mjs`
+(print link / capture / flow), `devin-oauth-exchange.mjs`, `probe-devin-v1-models.mjs`,
+`probe-devin-api.mjs`, `probe-devin-org.mjs`.
+
+## 2. String scanning
+
+- Use a **streamed string scanner** (Bun) over the binary/bundles to dump
+  readable ASCII/UTF-8 runs — hostnames, paths, header names, error strings,
+  env-var names, operation names all survive.
+- **Do not trust string scans alone for the body.** Struct fields in the
+  binary (e.g. snake_case `conversation_state`, `profile_arn`) can differ from
+  the actual wire (camelCase `awsJson1_0`). The captured body is the truth.
+- Strings give you *what* exists; only a capture (or the source) tells you the
+  exact wire shape.
+
+## 3. Beautifying minified JS
+
+- Hashed/minified JS bundles (Rolldown/esbuild) are readable after formatting —
+  string literals survive, they are not byte-encrypted.
+- `scripts/provider-probing/lib/beautify.ts` is a small beautifier built for
+  byte-corrupted / truncated input (it never throws; it degrades gracefully).
+  Use it to reformat extracted builder regions before reading them.
+- Search for behavior markers rather than reading linearly: e.g. `baseURL`,
+  `/inference`, header builders, `User-Agent` construction, auth builders.
+- See [`minified-and-encrypted-parsing.md`](minified-and-encrypted-parsing.md)
+  for the full recipe: surviving strings, carving JSON from concatenated blobs
+  (balanced-brace scanner), and handling encrypted/packed streams.
+
+## 4. Capturing a client's HTTPS traffic (Windows, Rust/Electron/CLI)
+
+Working recipe for capturing the *real* outbound HTTPS requests when static
+inspection can't pin the wire: header names, exact paths, request bodies.
+
+### When to use
+
+- String-scan gives operation names / hosts but not the exact request body,
+  path, or header set.
+- Direct HTTP guesses at an endpoint keep 403/401-ing.
+- You need byte-level proof of what the client sends, not a reconstruction.
+
+### Recipe
+
+1. **Tools.** `mitmproxy`/`mitmdump` (Python pip; on this box
+   `C:\Users\Aria\AppData\Local\Programs\Python\Python312\Scripts\`),
+   `certutil` (OS). Optional `openssl`.
+2. **Generate the CA.**
+   ```ps
+   mitmdump --set confdir="D:\tmp\scratch\mitmproxy" --version
+   ```
+   creates `mitmproxy-ca-cert.cer`, `mitmproxy-ca.pem`, etc.
+3. **Trust the CA in the Windows root store.**
+   ```ps
+   certutil -user -addstore Root "D:\tmp\scratch\mitmproxy\mitmproxy-ca-cert.cer"
+   ```
+   - Use `certutil -user`, **not** `Import-Certificate` (that pops a UI
+     prompt and fails non-interactively).
+   - Even Rust clients honor this: `rustls-native-certs` (0.8.x) reads the
+     Windows root store, so the CA works without touching Mozilla roots.
+4. **Start the proxy, saving flows.**
+   ```ps
+   mitmdump -p 18443 --set confdir="D:\tmp\scratch\mitmproxy" `
+     --flow-detail 2 -w "D:\tmp\scratch\kiro-mitm-flows"
+   ```
+   Run it in the background; logs stream to the shell output file.
+5. **Point the client at the proxy.**
+   ```ps
+   $env:HTTPS_PROXY="http://127.0.0.1:18443"
+   $env:HTTP_PROXY ="http://127.0.0.1:18443"
+   $env:NO_PROXY=""
+   ```
+   Hyper/reqwest/Rust AWS SDK clients honor these. Expect a few benign
+   CONNECTs first (update check, telemetry, OAuth); the interesting flows are
+   usually the last ones.
+6. **Run the client under a strict timeout.** If it hangs, the dumper shows
+   retries (same CONNECT repeating). That is a signal the proxy answered but
+   failed the TLS handshake — check the CA install, not the client.
+7. **Extract bodies to UTF-8 files** (the dumper's console output chokes on
+   non-cp1252 characters like `\u2192` and truncates big bodies):
+   ```python
+   # extract_flows.py  <flows>  <outdir>
+   from mitmproxy.io import FlowReader
+   from mitmproxy import http
+   import os, sys
+   outdir = sys.argv[2]; os.makedirs(outdir, exist_ok=True)
+   with open(sys.argv[1], "rb") as f:
+       for i, flow in enumerate(FlowReader(f).stream()):
+           if not isinstance(flow, http.HTTPFlow): continue
+           req = flow.request
+           target = req.headers.get("x-amz-target", "").replace("/", "_")
+           name = f"{i+1:03d}-{target or 'misc'}.txt"
+           with open(os.path.join(outdir, name), "w", encoding="utf-8") as w:
+               w.write(f"URL: {req.method} {req.pretty_url}\n")
+               w.write(f"TARGET: {target}\n")
+               w.write(f"UA: {req.headers.get('user-agent','')}\n")
+               w.write(f"BODY({len(req.content or b'')}B):\n")
+               w.write((req.content or b"").decode("utf-8", "replace") + "\n")
+   ```
+   `req.raw_content` may be `None` for requests with no body — guard it.
+
+### Pitfalls (all hit live)
+
+- **`AWS_ENDPOINT_URL` does NOT reliably redirect Rust AWS SDK clients.** The
+  Kiro CLI ignored it (still hit prod) despite the SDK supporting the env var —
+  the codegen client's endpoint override or `ignore_configured_endpoint_urls`
+  wins. Don't build the capture plan around it.
+- **A naive echo/dump server hangs the client.** Replying to CONNECT with a
+  plain `{}` leaves the TLS handshake unresolved; the client retries until
+  timeout. The proxy MUST terminate TLS (that is what mitmproxy does with its
+  CA).
+- **`Import-Certificate` is not scriptable** (UI prompt). Use
+  `certutil -user -addstore Root`.
+- **Save flows with `-w`.** `--flow-detail` console output alone loses data on
+  encoding errors; replay with `mitmdump -nr <flows> --flow-detail 4` or the
+  Python extractor above.
+- **Version segment in the UA matters upstream.** When replaying a captured
+  flow, note its `user-agent` needs the version segment (e.g.
+  `opencode/latest/2.2.0/cli`) before replaying.
+
+## 5. Where per-provider findings live
+
+The evidence ledgers produced with these techniques are consolidated in
+`documentation/research/<provider>/`:
+
+| Provider | Research files |
+|---|---|
+| Kiro | `documentation/research/kiro/` — `2026-11-02-kiro-ide-cli-protocol.md` (unpack evidence), `kiro-wire-protocol.md`, `2026-11-02-kiro-wire-verification.md` |
+| OpenCode | `documentation/research/opencode/` — `2026-11-02-desktop-2.2.5-binary-evidence.md` (unpack + capture + replay), `2026-11-02-opencode-free-tier.md` |
+| Cursor | `documentation/research/cursor/2026-10-20-cursor-run-protocol.md` |
+| CodeBuddy | `documentation/research/buddy/2026-10-19-codebuddy-chat-dispatch-headers.md` — plus `2026-11-02-codebuddy-cli-2.179.2-unpack-wire-audit.md` and `2026-11-02-workbuddy-desktop-unpack-wire-audit.md` |
+| Qoder | `documentation/research/qoder/` — current trusted set: `2026-11-16-qoder-desktop-0.5.12-unpack.md` (0.5.12 NSIS unpack + string-table decode), `2026-11-16-qoder-native-identity-pipeline.md`, `2026-11-17-qoder-core-wire-capture-0.5.12.md` (live worker-core capture: login, exchange, chat 200 + p4 envelope, `Encode=*` no-zstd wire). The 2026-11-05/11 notes (model matrix, COSY identity runs, 0.5.7 chat surface, wire capture) are superseded and live in `qoder/archive/`; earlier 2026-11-05 evidence in `archive/qoder-research-archive-2026-11-11.zip`. Qoder desktop 0.5.12 unpack: `D:\tmp\unpacked\qoder\` — NSIS/electron-builder, two-layer 7z extract; worker core 1.1.86-hotfix.5 runs standalone under Node (`resources/app.asar.unpacked/node_modules/@qoder-ai/qoder-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs`). Qoder CLI 1.1.83 (Windows x64, Bun compiled) unpack: `D:\tmp\unpacked\qoder\qoder-cli-windows-x64\unpacked\`. Daily-credits claim flow is the IDE's plain `Bearer` + machine headers (no WASM needed); COSY/WASM signing is universal but `machineId` is platform-specific (serial-hex on macOS/ELF, cached UUID on Windows) and a placeholder yields `403`; reference reimplementation repo `Public/qoder2api-hub` confirms the sash campaign flow |
+| Grok | `documentation/research/grok/2026-11-02-grok-build-1.0.70-unpack.md` |
+| Copilot | `documentation/research/copilot/` — `2026-10-15-copilot-chat-capability-map.md`, `-context-probe`, `-auto-routing`, `-auto-responses-500-repair-throw` |
+| Antigravity | unpack complete (Inno Setup 6.4 manual two-payload recovery, §1; `product.json` 44,752B carved; extension `google-antigravity` v0.0.1 located; OAuth endpoints `accounts.google.com`/`oauth2.googleapis.com` found). Wire-protocol research → `documentation/research/antigravity/` when written |
+| Devin | unpack complete (Inno Setup 6.4, `innounp 2.70.1`, 14,616 files / ~1.31 GB → `D:\tmp\unpacked\devin\`; VS Code fork + `devin-webapp-host` + appx). **OAuth captured live** (Google, 2026-11-06): `POST /api/auth1/connections` → client_ids; PKCE S256; `POST /api/auth1/google/exchange` → `{status:"authenticated", token:"auth1_…"}`; auth1 token alone 401 "No organizations found" until org exists. Docs → `documentation/research/devin/2026-11-06-devin-desktop-audit.md` |
+| Trae | `documentation/research/trae/` — `2026-11-06-trae-3.6.13-unpack-wire-audit.md`, `2026-11-06-trae-header-payload-builder-audit.md` |
+| DeepAI | `documentation/research/deepai/` — `2026-11-11-deepai-code-desktop-0.3.35-unpack-wire-audit.md`, `2026-11-11-deepai-code-live-wire-verification.md` |
+| Clixad | `documentation/research/clixad/2026-11-11-clixad-wire.md` |
+
+## Cleanup
+
+Stop the proxy process when done (`Stop-Process` on the mitmdump PID). Keep
+the flow file + extracted bodies in scratch (`D:\tmp\scratch\`) as evidence;
+do not commit credentials — redact `authorization` headers before adding any
+sample to the repo.

@@ -1,0 +1,194 @@
+import { providerAccounts } from "../../persistence/schema";
+import { liveModelCooldowns } from "../providers/catalog/catalog-projections";
+import type { ProviderQuotaResult } from "../../providers/quota/quota-contracts";
+import { log } from "../../observability/logger";
+import { GLOBAL_QUOTA_LENS } from "../../providers/quota/cache";
+import {
+  QUOTA_REFRESH_TIMEOUT_MS,
+  refreshAccountQuota,
+  signalFetch,
+  type QuotaRefreshDeps,
+  type QuotaRefreshTarget,
+} from "../../providers/quota/refresh";
+
+/** Shape returned for quota data on dashboard account responses. */
+interface QuotaRefreshView {
+  readonly source: string;
+  /**
+   * `ready` = a usable quota reading exists (successful fetch, cached or
+   * snapshot). `error` = the collector returned an error with no usable
+   * reading. `refreshing` = a background fill is in flight. `unknown` = no
+   * quota evidence at all (no collector surface, or an empty successful read
+   * with no timestamp) — the canonical wire representation for unknown quota.
+   */
+  readonly status: "ready" | "error" | "refreshing" | "unknown";
+  readonly plan: string | null;
+  readonly windows: ProviderQuotaResult["windows"];
+  readonly fetchedAt: string | null;
+  readonly lastAttemptAt: string | null;
+  readonly lastSuccessAt: string | null;
+  readonly error: string | null;
+  readonly refreshError?: string | null;
+}
+
+interface BackgroundQuotaRefreshJob {
+  readonly key: string;
+  readonly deps: QuotaRefreshDeps;
+  readonly target: QuotaRefreshTarget;
+}
+
+const backgroundQuotaRefreshQueue: BackgroundQuotaRefreshJob[] = [];
+const queuedBackgroundQuotaRefreshes = new Set<string>();
+const activeBackgroundQuotaRefreshes = new Set<string>();
+const MAX_BACKGROUND_QUOTA_REFRESHES = 4;
+
+/** Accounts currently queued or in flight, for the overview's `pending` flag. */
+export function pendingQuotaRefreshes(): ReadonlySet<string> {
+  const pending = new Set(activeBackgroundQuotaRefreshes);
+  for (const job of backgroundQuotaRefreshQueue) pending.add(job.target.accountId);
+  return pending;
+}
+
+function drainBackgroundQuotaRefreshes(): void {
+  while (
+    activeBackgroundQuotaRefreshes.size < MAX_BACKGROUND_QUOTA_REFRESHES &&
+    backgroundQuotaRefreshQueue.length > 0
+  ) {
+    const job = backgroundQuotaRefreshQueue.shift();
+    if (!job) return;
+    queuedBackgroundQuotaRefreshes.delete(job.key);
+    activeBackgroundQuotaRefreshes.add(job.target.accountId);
+    void refreshAccountQuota(
+      job.deps,
+      job.target,
+      signalFetch(AbortSignal.timeout(QUOTA_REFRESH_TIMEOUT_MS)),
+    )
+      .catch((error: unknown) => {
+        log.error(
+          `[quota] background refresh failed for account=${job.target.accountId}`,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      })
+      .finally(() => {
+        activeBackgroundQuotaRefreshes.delete(job.target.accountId);
+        drainBackgroundQuotaRefreshes();
+      });
+  }
+}
+
+/**
+ * Queues a background fill for one account. `targetLens` is part of the dedupe
+ * key because a global account is refreshed once for every tenant that can see
+ * it; the refresh itself is per-account and the cache write is shared.
+ */
+export function enqueueBackgroundQuotaRefresh(
+  deps: QuotaRefreshDeps,
+  target: QuotaRefreshTarget,
+): void {
+  const key = `${target.tenantId ?? GLOBAL_QUOTA_LENS}:${target.accountId}`;
+  if (queuedBackgroundQuotaRefreshes.has(key)) return;
+  if (activeBackgroundQuotaRefreshes.has(target.accountId)) return;
+  queuedBackgroundQuotaRefreshes.add(key);
+  backgroundQuotaRefreshQueue.push({ key, deps, target });
+  drainBackgroundQuotaRefreshes();
+}
+
+/** Shared quota-view projection used by the dashboard account endpoints. */
+export function toQuotaView(
+  quota: ProviderQuotaResult,
+  account: { lastSuccessAt?: Date | null },
+  timestamps: {
+    fetchedAt?: string | null;
+    lastAttemptAt?: string | null;
+    lastSuccessAt?: string | null;
+    refreshError?: string | null;
+    status?: "ready" | "error" | "refreshing" | "unknown";
+  } = {},
+): QuotaRefreshView {
+  const fetchedAt = timestamps.fetchedAt ?? account.lastSuccessAt?.toISOString() ?? null;
+  // A retained reading is a real answer, not a failure.
+  //
+  // `setCachedQuota` keeps the last successful reading and records a later
+  // failed attempt as `refreshError` — deliberately, so one transient timeout
+  // does not throw away a quota the provider actually reported. Reading
+  // `refreshError` as *the* error collapsed that distinction: an account whose
+  // quota is genuinely 0 (a perfectly valid free-plan answer) flipped to
+  // "quota unreachable" the moment any subsequent fetch timed out, and stayed
+  // there while the sweep retried.
+  //
+  // `refreshError` is still surfaced in its own field so the operator can see
+  // that the last attempt failed; only `quota.error` — no usable reading at
+  // all — makes the card an error.
+  const error = quota.error ?? null;
+  // Unknown quota: a successful read that carries no windows AND no timestamp
+  // is not evidence of anything — the canonical "no quota evidence" state.
+  // (A provider with a real zero-balance still reports windows/timestamps.)
+  const derivedStatus =
+    error !== null
+      ? ("error" as const)
+      : quota.windows.length === 0 && fetchedAt === null
+        ? ("unknown" as const)
+        : ("ready" as const);
+  return {
+    source: quota.source,
+    status: timestamps.status ?? derivedStatus,
+    plan: quota.plan ?? null,
+    windows: quota.windows,
+    fetchedAt,
+    lastAttemptAt: timestamps.lastAttemptAt ?? null,
+    lastSuccessAt: timestamps.lastSuccessAt ?? account.lastSuccessAt?.toISOString() ?? null,
+    error,
+    refreshError: timestamps.refreshError ?? null,
+  };
+}
+
+/**
+ * The account health block every quota view returns.
+ *
+ * One builder for all four call sites: a field added to one and missed by the
+ * others is exactly how the cooldown deadline went missing from the Quota
+ * health dialog, which showed a 429 message and no time. `cooldownUntil` is the
+ * account-wide deadline only — a model-scoped throttle moves `modelCooldowns`
+ * and deliberately leaves it null.
+ */
+export function toQuotaAccountHealth(row: {
+  status: string;
+  lastError: string | null;
+  lastErrorCategory: string | null;
+  cooldownUntil: Date | null;
+  modelCooldowns: unknown;
+}): {
+  status: string;
+  sanitizedMessage: string | null;
+  lastErrorCategory: string | null;
+  cooldownUntil: string | null;
+  modelCooldowns: Record<string, string>;
+} {
+  return {
+    status: row.status,
+    sanitizedMessage: row.lastError ?? null,
+    lastErrorCategory: row.lastErrorCategory ?? null,
+    cooldownUntil: row.cooldownUntil ? row.cooldownUntil.toISOString() : null,
+    // Only deadlines still in force are returned: the sweep prunes the column
+    // on a timer, so a raw read can carry an entry that has already elapsed and
+    // would render as a cooldown that is not in force.
+    modelCooldowns: liveModelCooldowns(row.modelCooldowns)?.modelCooldowns ?? {},
+  };
+}
+
+/** Removes credential material from global-account responses. */
+export function sanitizeGlobalAccount(
+  row: typeof providerAccounts.$inferSelect,
+): Record<string, unknown> {
+  return {
+    id: row.id,
+    providerId: row.providerId,
+    label: row.label,
+    credentialKind: row.credentialKind,
+    status: row.status,
+    consecutiveFailures: row.consecutiveFailures,
+    ...(row.lastSuccessAt ? { lastSuccessAt: row.lastSuccessAt.toISOString() } : {}),
+    ...(row.lastError ? { lastError: row.lastError } : {}),
+    ...(row.cooldownUntil ? { cooldownUntil: row.cooldownUntil.toISOString() } : {}),
+  };
+}

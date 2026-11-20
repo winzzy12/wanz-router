@@ -1,0 +1,156 @@
+---
+name: cartethyia-reverse-engineering
+description: "Use when reverse-engineering behavior within the Cartethyia codebase: trace an undocumented feature, reconstruct a request/data flow, map ownership across layers, or explain existing behavior before changing it."
+---
+# Reverse-engineer Cartethyia behavior
+
+Use this skill to understand behavior implemented by this repository. This is
+codebase-level reverse engineering: reconstruct Cartethyia's own request,
+state, routing, persistence, provider, or dashboard behavior from its source
+and tests. It is not a generic workflow for investigating unrelated software
+or external systems.
+
+## When to use
+
+- The user asks how an undocumented Cartethyia feature or behavior works.
+- A symptom crosses layers and its canonical owner is unclear.
+- Existing behavior needs to be reconstructed before a fix, migration, or
+  compatibility change.
+- The user asks to "reverse" or map a Cartethyia flow from observed behavior.
+
+For a reproducible failing request, wire payload, provider response, or live
+dispatch, continue with
+[`cartethyia-trace-replay`](../cartethyia-trace-replay/SKILL.md). For a focused
+domain change, use the closest skill listed in `AGENTS.md`.
+
+## Procedure
+
+1. **Bound the question.** State the observed behavior and the exact question
+   to answer. Choose the smallest relevant boundary: public endpoint, console
+   action, provider capability, state transition, or stored record.
+2. **Find the canonical owner.** Read `AGENTS.md` and identify the production
+   owner and its tests. Prefer code intelligence or targeted symbol/search
+   queries over broad repository-wide scans.
+3. **Trace both directions.** Follow inputs through validation and parsing,
+   canonical representation, policy/routing, provider or persistence effects,
+   and output encoding/UI. For stateful behavior, include the writer, reader,
+   lifecycle, and reset/migration path. Follow actual call sites and dispatch
+   boundaries rather than assuming similarly named modules are connected.
+4. **Separate evidence from inference.** Support each important step with the
+   owning symbol, test, or observed output. Label unverified assumptions and
+   conflicting/stale comments; do not promote a plausible explanation to fact.
+5. **Check invariants and alternatives.** Look for capability gates,
+   provider-specific behavior, degradation/failover, retries, cache keys,
+   time-dependent inputs, normalization, and error paths that could change the
+   outcome. Search consumers before recommending a change to a shared contract.
+6. **Reproduce only when useful.** Prefer focused tests and fake transports.
+   Use the disposable database configured with `CARTETHYIA_TEST_DATABASE_URL`
+   for persistence behavior. Live gateway verification must use the authorized
+   local setup and redact credentials, session identifiers, and sensitive
+   payloads. Do not probe external providers directly unless the user
+   explicitly authorizes a safe probe.
+7. **Report a compact behavior map.** Give the observed flow in order, cite
+   relevant files/symbols, state what is proven versus unknown, and name the
+   smallest next step. If implementation is requested, make the focused change
+   and verify its acceptance criterion instead of stopping at analysis.
+
+## Cartethyia flow landmarks
+
+- Gateway surfaces parse OpenAI Chat, Responses, Anthropic Messages, and other
+  supported inputs into the canonical request model.
+- Routing and admission decide whether a model/account/capability can serve
+  that request; retries and degradation are policy-controlled.
+- Provider adapters own provider-specific auth, headers, endpoint selection,
+  wire translation, and stream decoding.
+- Canonical usage and events feed response encoding, telemetry, and the
+  dashboard.
+- Console API and dashboard behavior has separate owners; keep the browser
+  dashboard free of backend-only modules and secrets.
+
+Treat this list as navigation, not a substitute for checking current code.
+Locate the current implementation and tests before drawing conclusions.
+
+## General principles
+
+These hold across every reverse-engineering session (proven on real vendors):
+
+- **Pin the installed build before trusting any public source.** A nearby
+  version corroborates; it does not describe the bundle you have.
+- **A label is not a wire identity.** A picker label can differ from the model
+  id; a catalog listing is not an entitlement (models listed by `/models` can
+  be rejected by `/responses`); a probe rejected at API-version validation
+  never read the body, so it says nothing about the body.
+- **Inference-only headers belong in the adapter's request-time path**, not in
+  a constant shared with OAuth and catalog calls.
+- **Grep by surrounding context, not by name.** Minified bundles scramble names
+  (`Ldn={ACTIVITY:"/algo/..."}` says nothing), but string literals survive —
+  search for a known literal (a message text, a base64 salt, a path) and pull
+  ±400-character windows, then chase the private constant at its call sites.
+- **When a guess grid 403s, stop guessing and capture the real request.**
+  Grids burn calls and prove nothing. Dump the client's own request instead
+  (wrapper, network log, or MITM proxy — see Techniques below).
+- **For a package client, read the protocol definitions first.** A `*.proto`,
+  a catalog JSON, or a `package.json` `files` list answers more than the
+  bundle; the bundle is the fallback, not the entry point. Minified bundles
+  rename everything — decode what is decodable and follow the *data* (surviving
+  field names, function signatures, protobuf field numbers).
+- **Keep an evidence ledger** (question, source and version, observed result,
+  what is still unknown). Turn only the verified rows into a Cartethyia
+  change, and exercise it with a fake transport. A diff against another
+  client's source is a hypothesis, not evidence.
+- **A label is not a wire identity — and neither is the presence of a
+  mechanism.** The same signing mechanism can be universal while its key
+  *value* is platform-specific (proven on Qoder 2026-11-04: WASM/IDSY
+  signing exists everywhere, but `machineId` is serial-hex on macOS/ELF and a
+  cached UUID on Windows; using a placeholder machineId yields `403 Signature
+  invalid`). When a flow is "universal", pin the exact per-platform input
+  values, not just the shape.
+- **Before a "works someday" recipe, check for a simpler shipping path.**
+  Qoder's daily-credits claim succeeded with plain `Bearer` + machine headers
+  (the IDE's own variant) while a WASM-signed request still 403'd — the
+  "fancier" path is not automatically the right one. Prefer the shipping
+  client's actual request over a reconstructed one.
+- **A repository that reimplements the protocol is primary evidence.** A
+  donor/reimplementation repo (e.g. the Qoder `qoder2api-hub` Python hub) can
+  confirm or correct a wire guess faster than another bundle scan — its code
+  is explicit, searchable, and often documents the very edge cases the bundle
+  hides.
+
+## Techniques & tools
+
+The working recipes (unpacking installers/ASAR/DMG, streamed string scanning,
+beautifying minified JS, capturing real HTTPS traffic with mitmproxy, window
+and pitfalls) live in one general reference:
+
+**[`references/unpacking-and-wire-capture.md`](references/unpacking-and-wire-capture.md)**
+
+For parsing minified bundles and encrypted/packed content recovered from a
+blob, see
+**[`references/minified-and-encrypted-parsing.md`](references/minified-and-encrypted-parsing.md)**
+(balanced-brace JSON carving, string-marker search, entropy/crypto checks,
+and the "stop guessing → capture the wire" fallback).
+
+Use them when the investigation leaves Cartethyia's own source for a client
+binary (CLI, desktop app, or SDK). Inspect statically — never launch an
+installer or extracted executable to discover behavior — and keep evidence in
+scratch (`D:\tmp\scratch\`), redacting credentials.
+
+## Evidence per provider
+
+Per-provider findings produced with those techniques live in
+`documentation/research/<provider>/` — the canonical home for dated evidence
+ledgers, not this skill. The current inventory (Kiro, OpenCode, Cursor,
+CodeBuddy, Qoder, Grok, Copilot, Antigravity, Devin, Trae, DeepAI,
+Clixad) is in
+[`references/unpacking-and-wire-capture.md`](references/unpacking-and-wire-capture.md#5-where-per-provider-findings-live).
+
+When a reverse-engineered wire change lands in the adapter, remember it passes
+through `src/protocol/translation/dialect/` (dialect resolution + thinking
+ladder) between the canonical model and the adapter — "why did the payload
+change" questions usually resolve there before reaching integration code.
+
+## Safety and scope
+
+- Inspect only code, tests, fixtures, logs, and local runtime behavior that the
+  user is authorized to access.
+- Do not edit generated output or unrelated code while tracing behavior.

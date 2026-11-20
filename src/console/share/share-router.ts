@@ -1,0 +1,558 @@
+import { globalOrOwnedBy } from "../../persistence/tenant-scope";
+// Public enrollment routes for shared API-key templates.
+//
+// Share URLs reveal policy and allow one child key to be created per canonical
+// client IP. The child bearer is returned only by the successful issue call.
+
+import { Elysia, type AnyElysia } from "elysia";
+import { and, eq, sql } from "drizzle-orm";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import { apiKeys, models, providers } from "../../persistence/schema";
+import { PublicModelCatalogStore } from "../providers/catalog/public-model-store";
+import { canonicalClientIpKey } from "../../security/ip-boundary";
+import { decryptCredentialToString } from "../../security/crypto";
+import { isModelAllowed, type ApiKeyAuthorizationSnapshot } from "../../security/api-key-auth";
+import { API_CONTENT_SECURITY_POLICY, X_FRAME_OPTIONS } from "../../security/outbound-headers";
+import {
+  SHARED_CHILD_HINT_MAX_LENGTH,
+  generateApiKeySecret,
+  resolveShareKeyPrefix,
+} from "../api-keys/contracts";
+import { popupImageBytes } from "../api-keys/share-popup-image";
+import type { ShareFamilyStats, ShareStatsPort } from "./share-stats";
+import { consoleSseResponse, createConsoleSseStream } from "../observability/sse";
+import { createSamplerLifecycle } from "../shared/sse-sampler";
+import { GatewayError, publicGatewayErrorBody } from "../../protocol/gateway-error";
+import { pickDefined } from "../shared/object";
+import {
+  type ShareLinkPolicy,
+  type ShareLinkRefusal,
+  type ShareLinkStore,
+} from "../../persistence/stores/share-store";
+
+/** Minimum accepted token length; generated tokens are 43 base64url chars. */
+const MIN_TOKEN_LENGTH = 20;
+
+/**
+ * Cadence of the share stats SSE snapshot.
+ *
+ * Roughly one tenth of the cache TTL (`SHARE_STATS_CACHE_TTL_SECONDS`, 300
+ * s), so nearly every tick is served from the cache and the cold-compute
+ * path runs at most once per five minutes per family. Short enough to still
+ * read as live.
+ */
+const SHARE_STATS_STREAM_INTERVAL_MS = 30_000;
+
+/**
+ * A subscriber of the process-wide share-stats sampler. A recipient is keyed
+ * by its family (`tenantId` + template key) so one sampler tick can push to
+ * many links without a per-connection timer.
+ */
+type ShareStatsListener = (family: ShareFamilyStats) => void;
+
+/**
+ * One sampler per gateway for share-stats SSE delivery. Previously each
+ * `/share/:token/stats/stream` connection ran its own 30s timer and re-read
+ * the family rollup; with N open tabs that is N timers and N rollups all
+ * reading the same data. Now a single process-level sampler ticks on the
+ * shared cadence and fans each computed rollup out to the subscribers whose
+ * family it matches. Timers run only while at least one stream is open.
+ */
+function createShareStatsSampler(config: {
+  readonly db: CartethyiaDatabase;
+  readonly shareStore: ShareLinkStore;
+  readonly stats: ShareStatsPort;
+}): { subscribe(token: string, listener: ShareStatsListener): () => void } {
+  const subscribers = new Map<string, Set<ShareStatsListener>>();
+  const lifecycle = createSamplerLifecycle();
+
+  const tick = async (): Promise<void> => {
+    // One resolve per family token: a recipient with several tabs shares one
+    // rollup, and a family with no open stream is never computed.
+    const tokens = new Set(subscribers.keys());
+    for (const token of tokens) {
+      const listeners = subscribers.get(token);
+      if (listeners === undefined || listeners.size === 0) continue;
+      try {
+        const family = await resolveFamilyStats(config.db, config.shareStore, config.stats, token);
+        if (family === null) continue;
+        for (const listener of listeners) listener(family);
+      } catch {
+        // A transient read must not interrupt the sampler.
+      }
+    }
+  };
+
+  const start = (): void => {
+    if (lifecycle.active === 0) return;
+    lifecycle.arm(SHARE_STATS_STREAM_INTERVAL_MS, async () => {
+      // Re-arm before the pass so the cadence survives a slow tick; `arm`
+      // refuses once the last subscriber has left.
+      start();
+      await tick();
+    });
+  };
+
+  return {
+    subscribe(token, listener) {
+      let listeners = subscribers.get(token);
+      if (listeners === undefined) {
+        listeners = new Set();
+        subscribers.set(token, listeners);
+      }
+      listeners.add(listener);
+      lifecycle.acquire();
+      start();
+      return () => {
+        listeners.delete(listener);
+        if (listeners.size === 0) subscribers.delete(token);
+        lifecycle.release();
+      };
+    },
+  };
+}
+
+/**
+ * Context and capabilities for one allowed model, sourced from the public
+ * catalog. Every field is nullable/optional so the page can show what is known
+ * and omit the rest rather than invent a value.
+ */
+export interface ShareModelInfo {
+  readonly contextLength: number | null;
+  readonly maxOutputTokens: number | null;
+  readonly capabilities: { readonly input?: string[]; readonly output?: string[] } | null;
+  readonly reasoning: boolean;
+  readonly toolCall: boolean;
+  /** Provider-level: the provider's adapter drives a hosted web-search tool. */
+  readonly webSearch: boolean;
+}
+
+interface ShareRouterOptions {
+  readonly db: CartethyiaDatabase;
+  readonly shareStore: ShareLinkStore;
+  /** Resolves the normalized client IP through the trusted-proxy boundary. */
+  readonly resolveClientIp: (request: Request) => string | null;
+  /** Family-wide activity rollup for the share page. Omitted in tests that do not exercise it. */
+  readonly stats?: ShareStatsPort;
+}
+
+function shareHeaders(): Headers {
+  return new Headers({
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-security-policy": API_CONTENT_SECURITY_POLICY,
+    "x-frame-options": X_FRAME_OPTIONS,
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+  });
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: shareHeaders() });
+}
+
+/**
+ * A link that does not resolve. The reason is returned to the caller as a code
+ * so the public page can say *what* happened: a paused key is re-enableable, a
+ * revoked key is not, and an expired link must be regenerated — a single
+ * "unavailable" message sent the operator looking in the wrong place.
+ */
+function notFound(refusal: ShareLinkRefusal = "not_found"): Response {
+  const message =
+    refusal === "expired"
+      ? "This share link has expired. Time for a fresh one 🌷"
+      : refusal === "revoked"
+        ? "This share link's key has been revoked. Ask for a new one 📩"
+        : refusal === "disabled"
+          ? "This share link's key is paused. Re-enable it when ready 🌱"
+          : "Share link is unavailable. This link leads nowhere — check it again 🔗";
+  const error = new GatewayError(`link_${refusal}`, 404, message);
+  return json(publicGatewayErrorBody(error), error.status);
+}
+
+function providerOf(slug: string): string {
+  const index = slug.indexOf("/");
+  return index === -1 ? "" : slug.slice(0, index);
+}
+
+function modelPrefixAllows(
+  prefix: string | null,
+  providerId: string,
+  modelId: string,
+): boolean {
+  return prefix === null || modelId.startsWith(prefix) || `${providerId}/${modelId}`.startsWith(prefix);
+}
+
+/** The authorization snapshot a share link's own policy implies. */
+function snapshotForShare(row: ShareLinkPolicy): ApiKeyAuthorizationSnapshot {
+  return {
+    api_key_id: row.id,
+    tenant_id: row.tenantId,
+    model_access_mode: row.modelAccessMode ?? "whitelist",
+    ...(row.modelList ? { model_list: row.modelList } : {}),
+  };
+}
+
+/**
+ * Context window and capabilities for each granted model, keyed by the name as
+ * it appears in the policy's `models` list.
+ *
+ * Read from the same `models` catalog `/v1/models` answers from, so the share
+ * page and the API never disagree about what a model can do. An entry may be
+ * bare (`glm-5.3-flash`) or provider-qualified (`openai/gpt-6-luna`); both match
+ * a catalog row by its model id. A name with no catalog row is simply absent —
+ * the page renders the id without a spec rather than inventing one.
+ */
+async function modelInfoForShare(
+  db: CartethyiaDatabase,
+  row: ShareLinkPolicy,
+  allowedModels: readonly string[],
+): Promise<Record<string, ShareModelInfo>> {
+  if (allowedModels.length === 0) return {};
+  const catalog = new PublicModelCatalogStore(db);
+  const metadata = await catalog.metadataForNames(row.tenantId, allowedModels);
+  const info: Record<string, ShareModelInfo> = {};
+  for (const name of allowedModels) {
+    const entry = metadata.get(name);
+    if (!entry) continue;
+    info[name] = {
+      contextLength: entry.contextLimit ?? null,
+      maxOutputTokens: entry.outputLimit ?? null,
+      capabilities: normalizeShareCapabilities(entry.modalities),
+      reasoning: entry.reasoning,
+      toolCall: entry.toolCall,
+      webSearch: entry.webSearch,
+    };
+  }
+  return info;
+}
+
+/** Input/output modalities a model advertises, or null when it states none. */
+function normalizeShareCapabilities(
+  value: unknown,
+): { readonly input?: string[]; readonly output?: string[] } | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as { input?: unknown; output?: unknown };
+  const pick = (candidate: unknown): string[] | undefined =>
+    Array.isArray(candidate) && candidate.every((v) => typeof v === "string")
+      ? (candidate as string[])
+      : undefined;
+  const input = pick(record.input);
+  const output = pick(record.output);
+  if (input === undefined && output === undefined) return null;
+  return {
+    ...pickDefined({ input }),
+    ...pickDefined({ output }),
+  };
+}
+
+/** Resolves the models a share recipient may use. */
+async function modelsForShare(db: CartethyiaDatabase, row: ShareLinkPolicy): Promise<string[]> {
+  const snapshot = snapshotForShare(row);
+  // A whitelist grants only its listed names, so the list is authoritative. A
+  // blacklist grants everything except its names, so the full catalog is the
+  // starting set and `isModelAllowed` removes the denied rows below.
+  const configured = row.modelAccessMode === "whitelist" ? row.modelList : null;
+  if (configured !== null && configured.length > 0) {
+    return configured
+      .filter((slug) => {
+        const providerId = providerOf(slug);
+        const modelId = providerId === "" ? slug : slug.slice(providerId.length + 1);
+        return (
+          isModelAllowed(snapshot, modelId, providerId || undefined, slug) &&
+          modelPrefixAllows(row.modelPrefix, providerId, modelId)
+        );
+      })
+      .sort((left, right) => left.localeCompare(right));
+  }
+  const providerScope = globalOrOwnedBy(providers.tenantId, row.tenantId);
+  const rows = await db
+    .select({ providerId: models.providerId, modelId: models.modelId })
+    .from(models)
+    .innerJoin(providers, eq(models.providerId, providers.id))
+    .where(and(eq(models.enabled, true), eq(providers.enabled, true), providerScope));
+  const slugs = new Set<string>();
+  for (const entry of rows) {
+    const slug = `${entry.providerId}/${entry.modelId}`;
+    if (!isModelAllowed(snapshot, entry.modelId, entry.providerId, slug)) continue;
+    if (!modelPrefixAllows(row.modelPrefix, entry.providerId, entry.modelId)) continue;
+    slugs.add(slug);
+  }
+  return [...slugs].sort((left, right) => left.localeCompare(right));
+}
+
+
+/**
+ * Family-wide activity for one share token, or `null` when the token does not
+ * resolve. Shared by the one-shot stats route and its SSE stream so both read
+ * exactly the same rollup — a drifting second copy would let the live view and
+ * the fetched snapshot disagree.
+ */
+async function resolveFamilyStats(
+  db: CartethyiaDatabase,
+  shareStore: ShareLinkStore,
+  stats: ShareStatsPort,
+  token: string,
+): Promise<ShareFamilyStats | null> {
+  const resolved = await shareStore.resolveShareLink(token);
+  if (resolved === null) return null;
+  const templateId = resolved.key.id;
+  const tenantId = resolved.key.tenantId;
+  // Recipient counts come back as one aggregate row: a family minted by the
+  // tenant can carry tens of thousands of children, and materializing their
+  // ids only to count them made every share-page view pay for the family's
+  // size. The fingerprint/quote keys the rollup needs are addressed by the
+  // template id (`familyApiKeyId`), which scopes in SQL without any id list.
+  const [counts] = await db
+    .select({
+      total: sql<number>`count(*)`,
+      active: sql<number>`sum(case when ${apiKeys.revokedAt} is null then 1 else 0 end)`,
+    })
+    .from(apiKeys)
+    .where(eq(apiKeys.parentKeyId, templateId));
+  const total = Number(counts?.total ?? 0);
+  const active = Number(counts?.active ?? 0);
+  // Rank only the models this link grants. A refused request still writes a
+  // telemetry row carrying the name the client asked for, so an unfiltered
+  // top-models table would list the very names the grant excludes. An
+  // unrestricted link (no allowlist) passes `undefined` and ranks everything —
+  // there is nothing to exclude, and filtering against the enabled catalog
+  // would hide real traffic for a model the catalog does not describe.
+  const configured = resolved.key.modelAccessMode === "whitelist" ? resolved.key.modelList : null;
+  const allowedModels =
+    configured !== null && configured.length > 0
+      ? await modelsForShare(db, resolved.key)
+      : undefined;
+  return stats.getFamilyStats(
+    tenantId,
+    { templateKeyId: templateId, memberCount: total + 1 },
+    { total, active },
+    allowedModels,
+  );
+}
+
+/** Creates the public enrollment page and one-time shared-key issuance route. */
+export function createShareRouter(options: ShareRouterOptions): AnyElysia {
+  const { db, shareStore } = options;
+  // The sampler is shared by every stats stream this router serves; it is a
+  // no-op when the composition omits `stats` (tests that do not exercise the
+  // stream), because `tick` never runs with no subscribers.
+  const statsSampler = options.stats === undefined
+    ? undefined
+    : createShareStatsSampler({ db, shareStore, stats: options.stats });
+
+  return new Elysia()
+    /**
+     * Resolves a link to its policy and, for a handoff link, the key it
+     * reveals.
+     *
+     * One endpoint serves both kinds because a token is exactly one of them. A
+     * page that had to guess the kind sent a personal key's handoff link to the
+     * enrollment lookup, which answered 404 for a link that was live — the
+     * recipient saw "link unavailable" for a URL the console had just handed
+     * out.
+     */
+    .get("/share/:token/data", async ({ params, request }) => {
+      if (typeof params.token !== "string") return notFound();
+      const token = params.token;
+      if (token.length < MIN_TOKEN_LENGTH) return notFound();
+      const outcome = await shareStore.resolveShareLinkOutcome(token);
+      if (!outcome.ok) return notFound(outcome.refusal);
+      const resolved = outcome.resolution;
+      const row = resolved.key;
+      const clientIp = options.resolveClientIp(request);
+      const clientIpKey = clientIp === null ? undefined : canonicalClientIpKey(clientIp);
+      const models = await modelsForShare(db, row);
+      const modelInfo = await modelInfoForShare(db, row, models);
+      void shareStore.touchView(token).catch(() => undefined);
+      const policy = {
+        name: row.name,
+        keyPrefix: row.keyPrefix,
+        dailyLimit: row.dailyTokenLimit,
+        monthlyLimit: row.monthlyTokenLimit,
+        oneTimeLimit: row.lifetimeTokenBudget,
+        requestsPerMinute: row.requestsPerMinute,
+        maxConcurrentRequests: row.maxConcurrentRequests,
+        concurrencyScope: row.concurrencyScope ?? "family",
+        modelPrefix: row.modelPrefix,
+        models,
+        modelInfo,
+        notes: {
+          title: row.notesTitle,
+          subtitle: row.notesSubtitle,
+          body: row.notesBody,
+        },
+        sharePopup: {
+          enabled: row.sharePopupEnabled,
+          hasImage: row.sharePopupImage !== null,
+          title: row.sharePopupTitle,
+          body: row.sharePopupBody,
+        },
+        expiresAt: row.expiresAt,
+      };
+      if (resolved.kind === "handoff") {
+        // The link exists and is authorized; only its retained ciphertext can
+        // be missing, which happens for a row written before token retention or
+        // under a rotated encryption key. That is a page with nothing to
+        // reveal, not a link the recipient mistyped.
+        let key: string | null = null;
+        if (resolved.key.keyEncrypted !== null) {
+          try {
+            key = decryptCredentialToString(resolved.key.keyEncrypted);
+          } catch {
+            key = null;
+          }
+        }
+        return json({ kind: "handoff", key, ...policy });
+      }
+      return json({
+        kind: "enroll",
+        canIssue: clientIpKey !== undefined,
+        ...policy,
+      });
+    })
+    /**
+     * The owner-uploaded popup art. It is served from the same bearer token as
+     * the page itself, so a link that stops resolving stops exposing the image.
+     */
+    .get("/share/:token/popup-image", async ({ params }) => {
+      if (typeof params.token !== "string") return notFound();
+      const token = params.token;
+      if (token.length < MIN_TOKEN_LENGTH) return notFound();
+      const resolved = await shareStore.resolveShareLink(token);
+      const image = resolved?.key.sharePopupImage;
+      const mime = resolved?.key.sharePopupImageMime;
+      if (!image || !mime) return notFound();
+      return new Response(new Blob([popupImageBytes(image)], { type: mime }), {
+        headers: {
+          "content-length": String(image.byteLength),
+          // Per-link content: a shared cache keyed only by path would keep
+          // serving it after the token stops resolving.
+          "cache-control": "private, max-age=300",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    })
+    .post("/share/:token/issue", async ({ params, request, set }) => {
+      if (typeof params.token !== "string") return notFound();
+      const token = params.token;
+      if (token.length < MIN_TOKEN_LENGTH) return notFound();
+      const clientIp = options.resolveClientIp(request);
+      if (clientIp === null)
+        return json({ error: { code: "client_ip_unavailable", message: "Client IP is unavailable" } }, 503);
+      const clientIpKey = canonicalClientIpKey(clientIp);
+      if (clientIpKey === undefined)
+        return json({ error: { code: "client_ip_invalid", message: "Client IP could not be normalized" } }, 400);
+
+      const outcome = await shareStore.resolveShareLinkOutcome(token);
+      // A handoff link reveals an existing key; it never mints one.
+      if (!outcome.ok) return notFound(outcome.refusal);
+      const resolved = outcome.resolution;
+      if (resolved.kind !== "enroll") return notFound();
+      // The recipient supplies the label hint; policy still comes exclusively from the template.
+      let nameHint: string;
+      try {
+        const body = (await request.json()) as { nameHint?: unknown };
+        if (typeof body.nameHint !== "string" || body.nameHint.trim().length === 0) {
+          return json({ error: { code: "name_required", message: "Your name is required" } }, 400);
+        }
+        nameHint = body.nameHint.trim().slice(0, SHARED_CHILD_HINT_MAX_LENGTH);
+      } catch {
+        return json({ error: { code: "name_required", message: "Your name is required" } }, 400);
+      }
+      const template = resolved.key;
+      const generated = generateApiKeySecret(resolveShareKeyPrefix(template.keyPrefix ?? undefined));
+      const issued = await shareStore.issueSharedApiKey(token, {
+        keyHash: generated.hash,
+        keyPrefix: generated.prefix,
+        clientIp,
+        clientIpKey,
+        nameHint,
+      });
+      if (issued.kind === "link_unavailable") return notFound();
+      if (issued.kind === "slot_full") {
+        return json({
+          error: {
+            code: "template_slot_full",
+            message: "This template has reached its maximum number of recipients.",
+          },
+        }, 429);
+      }
+      if (issued.kind === "already_issued") {
+        // The recipient's IP already enrolled from this link. The original
+        // bearer secret is not stored server-side, so it cannot be returned;
+        // refuse the duplicate mint instead. The share page surfaces this as
+        // a clear message rather than minting an unbounded key set.
+        return json({
+          error: {
+            code: "already_issued",
+            message: "This address already has a key from this share link.",
+          },
+        }, 409);
+      }
+      set.status = 201;
+      return json({
+        key: generated.secret,
+        keyId: issued.apiKeyId,
+        keyPrefix: issued.keyPrefix,
+        createdAt: issued.createdAt.toISOString(),
+      }, 201);
+    })
+    /**
+     * Family-wide activity for the share page's stats section.
+     *
+     * Aggregates every key the link has issued, not just the caller's own: the
+     * quota is shared, so a per-recipient figure would understate what the link
+     * has actually spent. The same bearer token that opens the page authorizes
+     * this, and the response carries masked IPs only — it is rendered outside
+     * the tenant.
+     */
+    .get("/share/:token/stats", async ({ params }) => {
+      if (typeof params.token !== "string") return notFound();
+      const token = params.token;
+      if (token.length < MIN_TOKEN_LENGTH) return notFound();
+      const stats = options.stats;
+      if (!stats) return json({ error: { code: "stats_unavailable", message: "Stats are unavailable" } }, 503);
+      const family = await resolveFamilyStats(db, shareStore, stats, token);
+      if (family === null) return notFound();
+      return json(family);
+    })
+    /**
+     * Live family activity for the share page's stats section, pushed over SSE.
+     *
+     * The stream sends one snapshot immediately on connect, then pushes on a
+     * shared sampler cadence so the recipient watches the shared quota move
+     * instead of refreshing. Telemetry is buffered server-side and drained in
+     * under a second, so the sampler's DB re-read is as fresh as an event bus
+     * would be. Same bearer token and same masked-IP rollup as the one-shot
+     * route; a token that stops resolving closes the stream rather than
+     * reporting zeros.
+     */
+    .get("/share/:token/stats/stream", async ({ params, request }) => {
+      if (typeof params.token !== "string") return notFound();
+      const token = params.token;
+      if (token.length < MIN_TOKEN_LENGTH) return notFound();
+      const stats = options.stats;
+      if (!stats || statsSampler === undefined) {
+        return json({ error: { code: "stats_unavailable", message: "Stats are unavailable" } }, 503);
+      }
+      const sampler = statsSampler;
+      return consoleSseResponse(
+        createConsoleSseStream(request.signal, (sender) => {
+          const unsubscribe = sampler.subscribe(token, (family) => sender.send("stats", family));
+          // Bootstrap: deliver the link's current rollup immediately, and close
+          // the stream if the token no longer resolves — the same terminal
+          // behavior the per-connection timer had on a dead link.
+          void resolveFamilyStats(db, shareStore, stats, token).then((family) => {
+            if (family === null) {
+              sender.send("error", { code: "link_not_found" });
+              unsubscribe();
+            } else {
+              sender.send("stats", family);
+            }
+          }).catch(() => undefined);
+          return unsubscribe;
+        }),
+      );
+    })
+}

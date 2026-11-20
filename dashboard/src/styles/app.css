@@ -230,13 +230,6 @@
   color: var(--text-tertiary);
   margin-top: 1px;
 }
-.brand-version-link {
-  color: inherit;
-  text-decoration: none;
-}
-.brand-version-link:hover {
-  color: var(--text-primary);
-}
 
 /* Update badge: a flat pill, no glow. It sits beside the version so an operator
  * sees "an update exists" without the badge reading as an alert. */

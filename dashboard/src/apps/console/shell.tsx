@@ -31,9 +31,8 @@ import { prefetchRouteIntent } from "../../data/route-prefetch";
 import { POLL } from "../../data/query-policy";
 import { useSystemHealth, useLatestRelease, useNotifications, type NotificationItem } from "../../hooks/system";
 import { useProviders } from "../../hooks/providers";
-import { DASHBOARD_RELEASE_LABEL, DASHBOARD_VERSION } from "../../lib/version";
+import { DASHBOARD_VERSION } from "../../lib/version";
 import { formatUptime } from "../../lib/format/numbers";
-import { GITHUB_RELEASES_URL } from "../../lib/links";
 import { isNewerRelease } from "../../data/contracts";
 import type { SessionUser } from "../../data/contracts";
 import { navigationGroups, resolveRouteMeta, type NavGroupDef, type NavItemDef } from "./route-manifest";
@@ -389,17 +388,6 @@ function NotificationsPopover({
                     title={health?.platform?.trim() || "Runtime platform unavailable"}
                   />
                 </dl>
-                <div className="flex items-start gap-3 rounded-card border border-inner-border bg-surface-2 p-4">
-                  <span className="mt-0.5 grid w-12 h-12 shrink-0 place-items-center rounded-control bg-surface-1 text-text-secondary">
-                    <Rocket size={16} aria-hidden="true" />
-                  </span>
-                  <div className="min-w-0">
-                    <p className="font-semibold text-caption">{DASHBOARD_RELEASE_LABEL}</p>
-                    <p className="text-badge text-text-secondary mt-1">
-                      High-performance AI Gateway & Protocol Orchestrator.
-                    </p>
-                  </div>
-                </div>
               </div>
             </div>
             </>,
@@ -759,7 +747,6 @@ export function DashboardShell({
                 <span>Wanz Router</span>
               </div>
               <div className="brand-version-badge">
-                <a href={GITHUB_RELEASES_URL} target="_blank" rel="noreferrer" className="brand-version-link">{DASHBOARD_RELEASE_LABEL}</a>
                 {updateAvailable ? (
                   // A button, not a link to GitHub: the badge says an update
                   // exists and the dialog tells the operator how to install it.

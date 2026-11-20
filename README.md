@@ -45,6 +45,11 @@ One command from any fresh Linux/macOS host:
 curl -fsSL https://raw.githubusercontent.com/winzzy12/wanz-router/main/quick-setup.sh | bash
 ```
 
+## Update
+```bash
+curl -fsSL https://raw.githubusercontent.com/winzzy12/wanz-router/main/quick-update.sh | bash
+```
+
 ## Uninstall
 ```bash
 wget https://raw.githubusercontent.com/winzzy12/wanz-router/main/uninstall.sh && chmod +x uninstall.sh && ./uninstall.sh

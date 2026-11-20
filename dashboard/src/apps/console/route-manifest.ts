@@ -83,6 +83,15 @@ export const CONSOLE_ROUTE_SPECS: readonly ConsoleRouteSpec[] = [
     icon: Cpu,
   },
   {
+    key: "providers",
+    path: "/providers",
+    navGroup: "Main",
+    navLabel: "Providers",
+    title: "Provider Catalog",
+    sub: "Upstream credentials, models, and latency",
+    icon: Server,
+  },
+  {
     key: "overview",
     path: "/",
     navGroup: "Main",
@@ -108,15 +117,6 @@ export const CONSOLE_ROUTE_SPECS: readonly ConsoleRouteSpec[] = [
     title: "Live Requests",
     sub: "Real-time request feed, refreshed every second",
     icon: Zap,
-  },
-  {
-    key: "providers",
-    path: "/providers",
-    navGroup: "Main",
-    navLabel: "Providers",
-    title: "Provider Catalog",
-    sub: "Upstream credentials, models, and latency",
-    icon: Server,
   },
   {
     key: "provider-detail",

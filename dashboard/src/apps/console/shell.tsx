@@ -9,7 +9,6 @@ import {
   Menu,
   Monitor,
   Moon,
-  Rocket,
   Server,
   Sun,
   Timer,
@@ -25,26 +24,16 @@ import { BackgroundLayer } from "../../features/customization/BackgroundLayer";
 import { applyCustomization, readCustomizationSettings } from "../../features/customization/settings";
 import { consoleRequest } from "../../data/api";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { UpdateDialog, readDismissedUpdate, dismissUpdate } from "../../components/UpdateDialog";
 import { clearPersistedCache, queryClient } from "../../data/query-client";
 import { prefetchRouteIntent } from "../../data/route-prefetch";
 import { POLL } from "../../data/query-policy";
-import { useSystemHealth, useLatestRelease, useNotifications, type NotificationItem } from "../../hooks/system";
+import { useSystemHealth, useNotifications, type NotificationItem } from "../../hooks/system";
 import { useProviders } from "../../hooks/providers";
-import { DASHBOARD_RELEASE_LABEL, DASHBOARD_VERSION } from "../../lib/version";
+import { DASHBOARD_RELEASE_LABEL } from "../../lib/version";
 import { formatUptime } from "../../lib/format/numbers";
 import { WANZ_ROUTER_REPO_URL } from "../../lib/links";
-import { isNewerRelease } from "../../data/contracts";
 import type { SessionUser } from "../../data/contracts";
 import { navigationGroups, resolveRouteMeta, type NavGroupDef, type NavItemDef } from "./route-manifest";
-
-function useSafeSystemHealth() {
-  try {
-    return useSystemHealth();
-  } catch {
-    return { data: undefined, isError: false, isFetching: false, isPending: false };
-  }
-}
 
 function ThemeToggle() {
   const [theme, setTheme] = useState(() => readConsoleTheme());
@@ -132,12 +121,9 @@ function MetricTile({
 
 function NotificationsPopover({
   notifications,
-  onOpenUpdate,
 }: {
   /** Live server-generated alerts; owned by the shell so it can key the badge. */
   readonly notifications: readonly NotificationItem[];
-  /** Opens the update dialog. A release alert is answered there, not on GitHub. */
-  onOpenUpdate: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(() => new Date());
@@ -314,28 +300,14 @@ function NotificationsPopover({
                           </span>
                         </span>
                         {notification.href ? (
-                          // A release alert opens the update dialog rather than
-                          // the release page: the page shows what changed, not
-                          // how to install, and the console is the thing that
-                          // can answer that. Other kinds keep their link.
-                          notification.kind === "update-available" ? (
-                            <button
-                              type="button"
-                              className="shrink-0 text-badge font-semibold text-accent"
-                              onClick={onOpenUpdate}
-                            >
-                              Update
-                            </button>
-                          ) : (
-                            <a
-                              className="shrink-0 text-badge font-semibold text-accent"
-                              href={notification.href}
-                              target="_blank"
-                              rel="noreferrer"
-                            >
-                              Open
-                            </a>
-                          )
+                          <a
+                            className="shrink-0 text-badge font-semibold text-accent"
+                            href={notification.href}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Open
+                          </a>
                         ) : null}
                       </article>
                     ))}
@@ -559,114 +531,9 @@ export function DashboardShell({
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutOpen, setLogoutOpen] = useState(false);
-  const [updateOpen, setUpdateOpen] = useState(false);
-  const [updating, setUpdating] = useState(false);
-  const [updateError, setUpdateError] = useState<string | null>(null);
-  const handleUpdateNow = async (): Promise<void> => {
-    setUpdating(true);
-    setUpdateError(null);
-    try {
-      await consoleRequest<void>("/updates/apply", { method: "POST" });
-    } catch (error) {
-      setUpdating(false);
-      setUpdateError(
-        typeof error === "object" && error !== null && "message" in error
-          ? String((error as { message: unknown }).message)
-          : "The update could not be started.",
-      );
-      return;
-    }
-    // block refresh
-    const beforeUnload = (e: BeforeUnloadEvent): void => { e.preventDefault(); };
-    window.addEventListener("beforeunload", beforeUnload);
-    // Poll the update status file, not the release tag: the installer reports
-    // success or failure itself, so a failed npm run ends the loop with an
-    // error instead of polling forever against a tag that never changes.
-    const target = latestTag;
-    const stop = (): void => {
-      window.clearInterval(poll);
-      window.removeEventListener("beforeunload", beforeUnload);
-    };
-    const poll = window.setInterval(async () => {
-      try {
-        const res = await fetch("/console/api/updates/status");
-        const data = (await res.json()) as { status?: string; stderrTail?: string };
-        if (data.status === "failed") {
-          stop();
-          setUpdating(false);
-          setUpdateError(
-            `The install failed${data.stderrTail ? `: ${data.stderrTail}` : ". See update.log in the config directory."}`,
-          );
-          return;
-        }
-        if (data.status === "success") {
-          stop();
-          // Verify the running version actually moved before reloading: a
-          // success that did not change the version would loop back to the
-          // same badge.
-          try {
-            const health = await fetch("/console/api/system/health");
-            const body = (await health.json()) as { version?: string };
-            if (body.version !== undefined && target !== undefined && body.version === target) {
-              window.location.reload();
-              return;
-            }
-          } catch {
-            // The gateway may still be restarting; fall back to reloading.
-          }
-          window.location.reload();
-          return;
-        }
-      } catch {
-        // Server restarting; keep polling. Fall back to the release-tag check
-        // so an old gateway without /updates/status still terminates the loop.
-        try {
-          const res = await fetch("/console/api/updates/release");
-          const data = (await res.json()) as { tag_name?: string };
-          if (target !== undefined && data.tag_name !== undefined && data.tag_name !== target) {
-            stop();
-            window.location.reload();
-          }
-        } catch {
-          // Keep polling.
-        }
-      }
-    }, 3000);
-  };
-  const healthQuery = useSafeSystemHealth();
-  // The release query is the cold-start fallback only: the notifications
-  // stream is the primary `update-available` badge/dialog source (S-04). The
-  // fetch runs once on mount and is never polled; the live stream announces a
-  // release when it appears. A stale badge on a fresh browser is still covered
-  // by the fallback.
-  const releaseQuery = useLatestRelease();
   const notifications = useNotifications();
-  // The running version is the gateway's, not the bundled dashboard's: the
-  // badge answers "is the install behind", and the install is what an operator
-  // upgrades. Falls back to the dashboard label so the badge still reads.
-  const localVersion = healthQuery.data?.version ?? DASHBOARD_VERSION;
-  const streamUpdate = notifications.find((item) => item.kind === "update-available");
-  const latestTag =
-    streamUpdate?.version ?? releaseQuery.data?.tag_name?.replace(/^v/, "");
-  const updateAvailable =
-    streamUpdate !== undefined || isNewerRelease(localVersion, latestTag);
   const providerDetailActive = /^\/providers\/[^/]+\/?$/.test(location.pathname);
   const providersQuery = useProviders(providerDetailActive);
-  // Prompts once per release, not once per load: the point of showing it at all
-  // is that an operator running an old version may never think to look. But a
-  // dialog that returns on every navigation punishes the person who has already
-  // decided not to upgrade, so dismissing records the version and the prompt
-  // stays away until a newer one is published.
-  const promptedRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!updateAvailable || latestTag === undefined) return;
-    if (readDismissedUpdate() === latestTag) return;
-    // The release query can settle more than once; without this the dialog
-    // would reopen after the operator closed it, within the same page life.
-    if (promptedRef.current === latestTag) return;
-    promptedRef.current = latestTag;
-    setUpdateOpen(true);
-  }, [updateAvailable, latestTag]);
 
   const prefetchIntent = (path: string): void => {
     void prefetchRouteIntent(queryClient, path);
@@ -756,26 +623,6 @@ export function DashboardShell({
                 >
                   {DASHBOARD_RELEASE_LABEL}
                 </a>
-                {updateAvailable ? (
-                  // A button, not a link to GitHub: the badge says an update
-                  // exists and the dialog tells the operator how to install it.
-                  // Sending them to a release page instead left them to work
-                  // out the npm command themselves, on a page that does not
-                  // mention it.
-                  <button
-                    type="button"
-                    onClick={() => setUpdateOpen(true)}
-                    className="brand-update-badge"
-                    title={
-                      latestTag === undefined
-                        ? "A newer Wanz Router release is available"
-                        : `Update available: v${latestTag} — how to install it`
-                    }
-                  >
-                    <Rocket size={9} className="shrink-0" aria-hidden="true" />
-                    {latestTag === undefined ? "update" : `Update v${latestTag}`}
-                  </button>
-                ) : null}
               </div>
             </div>
           </div>
@@ -838,10 +685,7 @@ export function DashboardShell({
             <div className="topbar-actions">
               <HeaderExtras />
               <ThemeToggle />
-              <NotificationsPopover
-                notifications={notifications}
-                onOpenUpdate={() => setUpdateOpen(true)}
-              />
+              <NotificationsPopover notifications={notifications} />
             </div>
           </header>
 
@@ -861,21 +705,6 @@ export function DashboardShell({
         message="You will need to sign in again to open the console."
         confirmLabel="Sign out"
         danger
-      />
-      <UpdateDialog
-        open={updateOpen}
-        onClose={() => setUpdateOpen(false)}
-        currentVersion={localVersion}
-        {...(latestTag === undefined ? {} : { latestVersion: latestTag })}
-        {...(streamUpdate?.href ?? releaseQuery.data?.html_url) === undefined
-          ? {}
-          : { releaseUrl: streamUpdate?.href ?? releaseQuery.data?.html_url }}
-        {...(latestTag === undefined
-          ? {}
-          : { onDismissVersion: () => dismissUpdate(latestTag) })}
-        onUpdateNow={handleUpdateNow}
-        updating={updating}
-        {...(updateError === null ? {} : { error: updateError })}
       />
     </>
   );

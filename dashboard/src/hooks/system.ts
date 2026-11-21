@@ -2,7 +2,7 @@ import { consoleRequest, fetchSessionUser } from "../data/api";
 import type { ApiErrorShape } from "../data/api";
 import { queryKeys } from "../data/query-keys";
 import type { SessionUser, UsageDimension } from "../data/contracts";
-import { assertAuditListPage, assertLatestRelease, assertSystemHealth, assertUsageBy, assertUsageChart, assertUsageRequestDetail, assertUsageRequests, assertUsageSummary, querySignal } from "../data/assert";
+import { assertAuditListPage, assertSystemHealth, assertUsageBy, assertUsageChart, assertUsageRequestDetail, assertUsageRequests, assertUsageSummary, querySignal } from "../data/assert";
 import { DASHBOARD_QUERY_OPTIONS, POLL } from "../data/query-policy";
 import { GITHUB_RELEASES_URL } from "../lib/links";
 import { useQuery } from "@tanstack/react-query";
@@ -11,14 +11,12 @@ import { useConsoleEventSource } from "./use-console-event-source";
 
 export interface NotificationItem {
   readonly id: string;
-  readonly kind: "memory-high" | "memory-growth" | "update-available";
+  readonly kind: "memory-high" | "memory-growth";
   readonly title: string;
   readonly message: string;
   readonly createdAt: string;
   readonly level: "warning" | "info";
   readonly href?: string;
-  /** Release tag behind an `update-available` alert (`v` prefix stripped). */
-  readonly version?: string;
 }
 
 const NOTIFICATION_MAX_ITEMS = 20;
@@ -31,7 +29,7 @@ function readNotification(value: unknown): NotificationItem | undefined {
     typeof item.title !== "string" ||
     typeof item.message !== "string" ||
     typeof item.createdAt !== "string" ||
-    (item.kind !== "memory-high" && item.kind !== "memory-growth" && item.kind !== "update-available") ||
+    (item.kind !== "memory-high" && item.kind !== "memory-growth") ||
     (item.level !== "warning" && item.level !== "info")
   ) return undefined;
   const notification: NotificationItem = {
@@ -44,17 +42,13 @@ function readNotification(value: unknown): NotificationItem | undefined {
     // Only the project's own release URL is trustworthy enough to render as a
     // link; anything else a notification might carry is shown as plain text.
     // Compared against the shared constant, not a literal: a rename would
-    // otherwise silently stop matching and strip the link from every
-    // update-available notification.
+    // otherwise silently stop matching and strip the link from every alert.
     ...(item.href === GITHUB_RELEASES_URL ? { href: item.href } : {}),
-    ...(typeof item.version === "string" && item.version.length > 0
-      ? { version: item.version.replace(/^v/, "") }
-      : {}),
   };
   return notification;
 }
 
-/** Streams server-generated memory and release alerts without blocking shell rendering. */
+/** Streams server-generated memory alerts without blocking shell rendering. */
 export function useNotifications(): readonly NotificationItem[] {
   const [notifications, setNotifications] = useState<readonly NotificationItem[]>([]);
 
@@ -109,29 +103,6 @@ export function useSystemHealth(options?: { enabled?: boolean; refetchInterval?:
     ...DASHBOARD_QUERY_OPTIONS,
     enabled: options?.enabled ?? true,
     refetchInterval: options?.refetchInterval ?? false,
-  });
-}
-
-/**
- * Loads the latest public GitHub release, or `null` when none is known.
- *
- * Proxied through the console API rather than fetched from the browser, so a
- * GitHub outage or rate limit is not one operator's console error. This is the
- * **cold-start fallback** only: the notifications stream is the primary
- * `update-available` badge/dialog source. The fetch runs once on mount (and
- * again when the query is invalidated) and is never polled — a release is
- * published rarely, and the live stream announces it when it appears.
- */
-export function useLatestRelease() {
-  return useQuery({
-    queryKey: queryKeys.releases.githubLatest,
-    queryFn: (context) =>
-      consoleRequest<unknown>("/updates/release", { signal: querySignal(context) }).then(
-        assertLatestRelease,
-      ),
-    ...DASHBOARD_QUERY_OPTIONS,
-    staleTime: 30 * 60_000,
-    retry: false,
   });
 }
 

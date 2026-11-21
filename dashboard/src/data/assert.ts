@@ -18,7 +18,6 @@ import type {
   ProviderResponse,
   ProviderRoutingResponse,
   SystemHealthResponse,
-  LatestRelease,
   UsageByResponse,
   UsageChartResponse,
   UsageRequestDetail,
@@ -43,17 +42,6 @@ function isStringArray(value: unknown): value is string[] {
  * release is known, which is what the server returns when GitHub is unreachable
  * — so an absent badge, not an error, is what the operator sees.
  */
-export function assertLatestRelease(value: unknown): LatestRelease | null {
-  if (value === null) return null;
-  if (
-    !isRecord(value) ||
-    typeof value.tag_name !== "string" ||
-    typeof value.html_url !== "string"
-  ) {
-    throw invalidResponse("Invalid release response");
-  }
-  return { tag_name: value.tag_name, html_url: value.html_url };
-}
 
 export function assertSystemHealth(value: unknown): SystemHealthResponse {
   if (!isRecord(value) || !["healthy", "degraded", "unhealthy"].includes(value.status as string)) {
